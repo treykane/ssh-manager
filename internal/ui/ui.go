@@ -189,7 +189,7 @@ func (m modelUI) View() string {
 	head := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render("SSH Manager Dashboard")
 	subhead := fmt.Sprintf("hosts=%d shown=%d tunnels=%d refresh=%ds", len(m.hosts), len(m.filtered), len(m.tunnels), clampRefresh(m.cfg.UI.RefreshSeconds))
 	left := strings.Builder{}
-	left.WriteString("Hosts (j/k to navigate)\n")
+	left.WriteString("j/k to navigate; [T] means active tunnel.\n")
 	for i, h := range m.filtered {
 		cursor := " "
 		if i == m.sel {
@@ -206,7 +206,6 @@ func (m modelUI) View() string {
 	}
 
 	detail := strings.Builder{}
-	detail.WriteString("Details\n")
 	if len(m.filtered) > 0 {
 		h := m.filtered[m.sel]
 		detail.WriteString(fmt.Sprintf("Alias: %s\nHost: %s\nUser: %s\nPort: %d\nProxyJump: %s\n", h.Alias, h.DisplayTarget(), emptyDash(h.User), h.Port, emptyDash(h.ProxyJump)))
@@ -224,7 +223,6 @@ func (m modelUI) View() string {
 	}
 
 	tbl := strings.Builder{}
-	tbl.WriteString("Active Tunnels\n")
 	tbl.WriteString(fmt.Sprintf("%-24s %-20s %-20s %-10s %-8s %-8s\n", "HOST", "LOCAL", "REMOTE", "STATE", "PID", "LAT"))
 	for _, rt := range m.tunnels {
 		tbl.WriteString(fmt.Sprintf("%-24s %-20s %-20s %-10s %-8d %-8d\n", rt.HostAlias, rt.Local, rt.Remote, rt.State, rt.PID, rt.LatencyMS))
@@ -244,6 +242,12 @@ func (m modelUI) View() string {
 
 	quickHelp := "Keys: Enter connect | t toggle tunnel | / filter | r refresh | ? help | q quit"
 	main := m.renderMainPanels(left.String(), detail.String())
+	tunnels := m.renderPanel("Active Tunnels", tbl.String(), m.effectiveWidth(), lipgloss.Color("63"))
+	status := m.renderPanel("Status", m.status, m.effectiveWidth(), lipgloss.Color("205"))
+	help := ""
+	if m.showHelp {
+		help = m.renderPanel("Help", m.helpBlock(), m.effectiveWidth(), lipgloss.Color("244"))
+	}
 	layout := lipgloss.JoinVertical(
 		lipgloss.Left,
 		head,
@@ -251,10 +255,10 @@ func (m modelUI) View() string {
 		filterLine,
 		quickHelp,
 		main,
-		tbl.String(),
-		m.helpBlock(),
+		tunnels,
+		help,
 		warn,
-		"Status: "+m.status,
+		status,
 	)
 	return layout
 }
@@ -317,32 +321,25 @@ func (m modelUI) guidanceForHost(h model.HostEntry) string {
 }
 
 func (m modelUI) renderMainPanels(hostsPanel, detailsPanel string) string {
-	width := m.width
-	if width <= 0 {
-		width = 100
-	}
+	width := m.effectiveWidth()
 	if width < 96 {
 		return lipgloss.JoinVertical(
 			lipgloss.Left,
-			lipgloss.NewStyle().Width(width).Render(hostsPanel),
-			lipgloss.NewStyle().Width(width).Render(detailsPanel),
+			m.renderPanel("Hosts", hostsPanel, width, lipgloss.Color("39")),
+			m.renderPanel("Details", detailsPanel, width, lipgloss.Color("69")),
 		)
 	}
 	leftWidth := width / 2
 	rightWidth := width - leftWidth
 	return lipgloss.JoinHorizontal(
 		lipgloss.Top,
-		lipgloss.NewStyle().Width(leftWidth).Render(hostsPanel),
-		lipgloss.NewStyle().Width(rightWidth).Render(detailsPanel),
+		m.renderPanel("Hosts", hostsPanel, leftWidth, lipgloss.Color("39")),
+		m.renderPanel("Details", detailsPanel, rightWidth, lipgloss.Color("69")),
 	)
 }
 
 func (m modelUI) helpBlock() string {
-	if !m.showHelp {
-		return ""
-	}
 	return strings.Join([]string{
-		"Help",
 		"  Navigation: j/k or arrow keys move selection.",
 		"  Filtering: press /, type alias/host text, then Enter.",
 		"  Connect: press Enter on selected host.",
@@ -350,6 +347,28 @@ func (m modelUI) helpBlock() string {
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",
 	}, "\n")
+}
+
+func (m modelUI) effectiveWidth() int {
+	if m.width <= 0 {
+		return 100
+	}
+	return m.width
+}
+
+func (m modelUI) renderPanel(title, body string, width int, accent lipgloss.Color) string {
+	if width < 24 {
+		width = 24
+	}
+	header := lipgloss.NewStyle().Bold(true).Foreground(accent).Render(title)
+	content := strings.TrimSuffix(body, "\n")
+	panel := strings.TrimSpace(header + "\n" + content)
+	return lipgloss.NewStyle().
+		Width(width).
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(accent).
+		Padding(0, 1).
+		Render(panel)
 }
 
 func init() {
