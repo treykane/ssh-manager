@@ -1,3 +1,4 @@
+// Package model defines shared data types used across the application.
 package model
 
 import "time"
@@ -10,6 +11,7 @@ type ForwardSpec struct {
 	RemotePort int    `json:"remote_port"`
 }
 
+// LocalString returns the local address with default "localhost".
 func (f ForwardSpec) LocalString() string {
 	if f.LocalAddr == "" {
 		return "localhost"
@@ -17,6 +19,7 @@ func (f ForwardSpec) LocalString() string {
 	return f.LocalAddr
 }
 
+// RemoteString returns the remote address with default "localhost".
 func (f ForwardSpec) RemoteString() string {
 	if f.RemoteAddr == "" {
 		return "localhost"
@@ -35,6 +38,7 @@ type HostEntry struct {
 	Forwards     []ForwardSpec `json:"forwards,omitempty"`
 }
 
+// DisplayTarget returns the hostname for display, falling back to alias.
 func (h HostEntry) DisplayTarget() string {
 	if h.HostName != "" {
 		return h.HostName
@@ -42,6 +46,7 @@ func (h HostEntry) DisplayTarget() string {
 	return h.Alias
 }
 
+// TunnelState represents the lifecycle state of an SSH tunnel.
 type TunnelState string
 
 const (
@@ -52,6 +57,7 @@ const (
 	TunnelStopping TunnelState = "stopping"
 )
 
+// TunnelRuntime tracks the runtime state of an active or historical tunnel.
 type TunnelRuntime struct {
 	ID        string      `json:"id"`
 	HostAlias string      `json:"host_alias"`

@@ -1,3 +1,4 @@
+// Package config parses OpenSSH configuration files with Include directive support.
 package config
 
 import (
@@ -11,8 +12,10 @@ import (
 	"strings"
 
 	"github.com/treykane/ssh-manager/internal/model"
+	"github.com/treykane/ssh-manager/internal/util"
 )
 
+// ParseResult contains parsed hosts and any warnings encountered.
 type ParseResult struct {
 	Hosts    []model.HostEntry
 	Warnings []string
@@ -45,8 +48,8 @@ func ParseFile(path string) (ParseResult, error) {
 }
 
 func parseRecursive(path string, seen map[string]bool, depth int) ([]rawBlock, []string, error) {
-	if depth > 16 {
-		return nil, nil, fmt.Errorf("include depth exceeded at %s", path)
+	if depth > util.MaxIncludeDepth {
+		return nil, nil, fmt.Errorf("include depth exceeded at %s (max %d)", path, util.MaxIncludeDepth)
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -144,6 +147,8 @@ func parseRecursive(path string, seen map[string]bool, depth int) ([]rawBlock, [
 	return blocks, warnings, nil
 }
 
+// compileHosts resolves host aliases and merges configuration blocks.
+// Returns hosts sorted alphabetically by alias.
 func compileHosts(blocks []rawBlock) []model.HostEntry {
 	aliasSet := map[string]struct{}{}
 	for _, b := range blocks {
@@ -194,6 +199,8 @@ func compileHosts(blocks []rawBlock) []model.HostEntry {
 		}
 		hosts = append(hosts, h)
 	}
+	// Sort hosts by alias for consistent output
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].Alias < hosts[j].Alias })
 	return hosts
 }
 

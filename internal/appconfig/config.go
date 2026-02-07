@@ -1,3 +1,4 @@
+// Package appconfig manages application configuration and runtime file paths.
 package appconfig
 
 import (
@@ -8,15 +9,18 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// UIConfig contains TUI display settings.
 type UIConfig struct {
 	RefreshSeconds int `yaml:"refresh_seconds"`
 }
 
+// Config holds application-level configuration.
 type Config struct {
 	DefaultHealthCommand string   `yaml:"default_health_command"`
 	UI                   UIConfig `yaml:"ui"`
 }
 
+// Default returns the default configuration.
 func Default() Config {
 	return Config{
 		DefaultHealthCommand: "uptime",
@@ -24,6 +28,8 @@ func Default() Config {
 	}
 }
 
+// ConfigDir returns the application config directory path.
+// Uses XDG_CONFIG_HOME if set, otherwise ~/.config/ssh-manager.
 func ConfigDir() (string, error) {
 	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
 		return filepath.Join(xdg, "ssh-manager"), nil
@@ -35,6 +41,7 @@ func ConfigDir() (string, error) {
 	return filepath.Join(home, ".config", "ssh-manager"), nil
 }
 
+// RuntimeFilePath returns the full path to runtime.json.
 func RuntimeFilePath() (string, error) {
 	d, err := ConfigDir()
 	if err != nil {
@@ -43,6 +50,8 @@ func RuntimeFilePath() (string, error) {
 	return filepath.Join(d, "runtime.json"), nil
 }
 
+// Load reads config.yaml from the config directory.
+// If the file doesn't exist, creates it with defaults.
 func Load() (Config, error) {
 	d, err := ConfigDir()
 	if err != nil {
@@ -76,6 +85,7 @@ func Load() (Config, error) {
 	return cfg, nil
 }
 
+// Save writes config to config.yaml.
 func Save(cfg Config) error {
 	d, err := ConfigDir()
 	if err != nil {

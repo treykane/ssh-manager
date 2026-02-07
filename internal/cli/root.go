@@ -1,9 +1,11 @@
+// Package cli provides the command-line interface for ssh-manager.
 package cli
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"sort"
 	"strconv"
@@ -16,8 +18,10 @@ import (
 	"github.com/treykane/ssh-manager/internal/sshclient"
 	"github.com/treykane/ssh-manager/internal/tunnel"
 	"github.com/treykane/ssh-manager/internal/ui"
+	"github.com/treykane/ssh-manager/internal/util"
 )
 
+// NewRootCommand creates the root cobra command.
 func NewRootCommand() *cobra.Command {
 	root := &cobra.Command{
 		Use:   "ssh-manager",
@@ -41,10 +45,10 @@ func newListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			sort.Slice(res.Hosts, func(i, j int) bool { return res.Hosts[i].Alias < res.Hosts[j].Alias })
+			// Hosts are already sorted by parser
 			fmt.Printf("%-24s %-24s %-8s %-16s %s\n", "ALIAS", "HOSTNAME", "PORT", "USER", "FORWARDS")
 			for _, h := range res.Hosts {
-				fmt.Printf("%-24s %-24s %-8d %-16s %d\n", h.Alias, h.DisplayTarget(), h.Port, defaultString(h.User, "-"), len(h.Forwards))
+				fmt.Printf("%-24s %-24s %-8d %-16s %d\n", h.Alias, h.DisplayTarget(), h.Port, util.EmptyDash(h.User), len(h.Forwards))
 			}
 			if len(res.Warnings) > 0 {
 				fmt.Fprintln(os.Stderr, "warnings:")
@@ -60,7 +64,9 @@ func newListCmd() *cobra.Command {
 func newTunnelCmd() *cobra.Command {
 	client := sshclient.New()
 	mgr := tunnel.NewManager(client)
-	_ = mgr.LoadRuntime()
+	if err := mgr.LoadRuntime(); err != nil {
+		slog.Warn("failed to load tunnel runtime", "error", err)
+	}
 	var root = &cobra.Command{Use: "tunnel", Short: "Manage SSH tunnels"}
 
 	var forwardArg string
@@ -171,15 +177,11 @@ func resolveForwards(host model.HostEntry, forwardArg string) ([]model.ForwardSp
 	return []model.ForwardSpec{fwd}, nil
 }
 
-func defaultString(v, fallback string) string {
-	if strings.TrimSpace(v) == "" {
-		return fallback
-	}
-	return v
-}
-
+// ConnectOnce establishes an interactive SSH session to the given host.
+// Used by the TUI when user presses Enter on a host.
 func ConnectOnce(host model.HostEntry) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	// Use a long timeout for interactive sessions (user may work for hours)
+	ctx, cancel := context.WithTimeout(context.Background(), 24*time.Hour)
 	defer cancel()
 	c := sshclient.New()
 	return c.RunInteractive(ctx, host)

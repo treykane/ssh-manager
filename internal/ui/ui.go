@@ -1,9 +1,9 @@
+// Package ui provides the terminal user interface (TUI) dashboard for ssh-manager.
 package ui
 
 import (
 	"fmt"
-	"os"
-	"sort"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -14,11 +14,15 @@ import (
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 	"github.com/treykane/ssh-manager/internal/tunnel"
+	"github.com/treykane/ssh-manager/internal/util"
 )
 
 type tickMsg time.Time
 
-type modelUI struct {
+type statusMsg string
+
+// model represents the Bubble Tea model for the dashboard.
+type dashboardModel struct {
 	hosts      []model.HostEntry
 	filtered   []model.HostEntry
 	sel        int
@@ -35,31 +39,39 @@ type modelUI struct {
 	ssh        *sshclient.Client
 }
 
-func initialModel() modelUI {
-	cfg, _ := appconfig.Load()
+func initialModel() dashboardModel {
+	cfg, err := appconfig.Load()
+	if err != nil {
+		slog.Warn("failed to load app config, using defaults", "error", err)
+		cfg = appconfig.Default()
+	}
+
 	ssh := sshclient.New()
 	mgr := tunnel.NewManager(ssh)
-	_ = mgr.LoadRuntime()
-	m := modelUI{cfg: cfg, mgr: mgr, ssh: ssh}
+	if err := mgr.LoadRuntime(); err != nil {
+		slog.Warn("failed to load tunnel runtime", "error", err)
+	}
+
+	m := dashboardModel{cfg: cfg, mgr: mgr, ssh: ssh}
 	m.reloadConfig()
 	m.status = "Ready. Select a host, then Enter to connect or t to manage its first tunnel."
 	return m
 }
 
-func (m *modelUI) reloadConfig() {
+func (m *dashboardModel) reloadConfig() {
 	res, err := config.ParseDefault()
 	if err != nil {
 		m.status = "config parse error: " + err.Error()
 		return
 	}
-	sort.Slice(res.Hosts, func(i, j int) bool { return res.Hosts[i].Alias < res.Hosts[j].Alias })
+	// Hosts are already sorted by parser
 	m.hosts = res.Hosts
 	m.warnings = res.Warnings
 	m.applyFilter()
 	m.tunnels = m.mgr.Snapshot()
 }
 
-func (m *modelUI) applyFilter() {
+func (m *dashboardModel) applyFilter() {
 	if strings.TrimSpace(m.filter) == "" {
 		m.filtered = append([]model.HostEntry(nil), m.hosts...)
 	} else {
@@ -81,16 +93,16 @@ func (m *modelUI) applyFilter() {
 
 func tickCmd(seconds int) tea.Cmd {
 	if seconds <= 0 {
-		seconds = 3
+		seconds = util.DefaultRefreshSeconds
 	}
 	return tea.Tick(time.Duration(seconds)*time.Second, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
-func (m modelUI) Init() tea.Cmd {
+func (m dashboardModel) Init() tea.Cmd {
 	return tickCmd(m.cfg.UI.RefreshSeconds)
 }
 
-func (m modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tickMsg:
 		m.tunnels = m.mgr.Snapshot()
@@ -183,11 +195,11 @@ func (m modelUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-type statusMsg string
-
-func (m modelUI) View() string {
+func (m dashboardModel) View() string {
 	head := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render("SSH Manager Dashboard")
-	subhead := fmt.Sprintf("hosts=%d shown=%d tunnels=%d refresh=%ds", len(m.hosts), len(m.filtered), len(m.tunnels), clampRefresh(m.cfg.UI.RefreshSeconds))
+	subhead := fmt.Sprintf("hosts=%d shown=%d tunnels=%d refresh=%ds",
+		len(m.hosts), len(m.filtered), len(m.tunnels), clampRefresh(m.cfg.UI.RefreshSeconds))
+
 	left := strings.Builder{}
 	left.WriteString("j/k to navigate; [T] means active tunnel.\n")
 	for i, h := range m.filtered {
@@ -208,7 +220,8 @@ func (m modelUI) View() string {
 	detail := strings.Builder{}
 	if len(m.filtered) > 0 {
 		h := m.filtered[m.sel]
-		detail.WriteString(fmt.Sprintf("Alias: %s\nHost: %s\nUser: %s\nPort: %d\nProxyJump: %s\n", h.Alias, h.DisplayTarget(), emptyDash(h.User), h.Port, emptyDash(h.ProxyJump)))
+		detail.WriteString(fmt.Sprintf("Alias: %s\nHost: %s\nUser: %s\nPort: %d\nProxyJump: %s\n",
+			h.Alias, h.DisplayTarget(), util.EmptyDash(h.User), h.Port, util.EmptyDash(h.ProxyJump)))
 		detail.WriteString("Forwards:\n")
 		if len(h.Forwards) == 0 {
 			detail.WriteString("  (none)\n")
@@ -263,6 +276,7 @@ func (m modelUI) View() string {
 	return layout
 }
 
+// Run starts the TUI dashboard.
 func Run() error {
 	if err := sshclient.EnsureSSHBinary(); err != nil {
 		return err
@@ -272,21 +286,14 @@ func Run() error {
 	return err
 }
 
-func emptyDash(s string) string {
-	if strings.TrimSpace(s) == "" {
-		return "-"
-	}
-	return s
-}
-
 func clampRefresh(seconds int) int {
 	if seconds <= 0 {
-		return 3
+		return util.DefaultRefreshSeconds
 	}
 	return seconds
 }
 
-func (m modelUI) hostHasActiveTunnel(alias string) bool {
+func (m dashboardModel) hostHasActiveTunnel(alias string) bool {
 	for _, rt := range m.tunnels {
 		if rt.HostAlias != alias {
 			continue
@@ -298,7 +305,7 @@ func (m modelUI) hostHasActiveTunnel(alias string) bool {
 	return false
 }
 
-func (m modelUI) guidanceForHost(h model.HostEntry) string {
+func (m dashboardModel) guidanceForHost(h model.HostEntry) string {
 	var lines []string
 	lines = append(lines, "  - Press Enter to open an interactive ssh session.")
 	if len(h.Forwards) == 0 {
@@ -320,7 +327,7 @@ func (m modelUI) guidanceForHost(h model.HostEntry) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func (m modelUI) renderMainPanels(hostsPanel, detailsPanel string) string {
+func (m dashboardModel) renderMainPanels(hostsPanel, detailsPanel string) string {
 	width := m.effectiveWidth()
 	if width < 96 {
 		return lipgloss.JoinVertical(
@@ -338,7 +345,7 @@ func (m modelUI) renderMainPanels(hostsPanel, detailsPanel string) string {
 	)
 }
 
-func (m modelUI) helpBlock() string {
+func (m dashboardModel) helpBlock() string {
 	return strings.Join([]string{
 		"  Navigation: j/k or arrow keys move selection.",
 		"  Filtering: press /, type alias/host text, then Enter.",
@@ -349,14 +356,14 @@ func (m modelUI) helpBlock() string {
 	}, "\n")
 }
 
-func (m modelUI) effectiveWidth() int {
+func (m dashboardModel) effectiveWidth() int {
 	if m.width <= 0 {
 		return 100
 	}
 	return m.width
 }
 
-func (m modelUI) renderPanel(title, body string, width int, accent lipgloss.Color) string {
+func (m dashboardModel) renderPanel(title, body string, width int, accent lipgloss.Color) string {
 	if width < 24 {
 		width = 24
 	}
@@ -369,8 +376,4 @@ func (m modelUI) renderPanel(title, body string, width int, accent lipgloss.Colo
 		BorderForeground(accent).
 		Padding(0, 1).
 		Render(panel)
-}
-
-func init() {
-	_ = os.Setenv("TERM", os.Getenv("TERM"))
 }
