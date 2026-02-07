@@ -1,0 +1,7 @@
+Host *
+  User deploy
+
+Host web
+  HostName web.internal
+  Port 2222
+  LocalForward 8080 localhost:80
