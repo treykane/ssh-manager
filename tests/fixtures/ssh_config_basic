@@ -1,3 +1,20 @@
+# Test fixture: basic SSH config for parser tests.
+#
+# This file provides a minimal but representative SSH configuration used by
+# internal/config/parser_test.go and any other tests that need a realistic
+# SSH config to parse.
+#
+# It exercises the following parser features:
+#   - Wildcard Host block ("Host *") providing default directives to all hosts.
+#   - Concrete Host block ("Host web") with explicit overrides.
+#   - Common directives: User, HostName, Port, LocalForward.
+#   - Directive merging: "web" should inherit User=deploy from the wildcard
+#     block, then override Port with 2222 and add a LocalForward rule.
+#
+# To use this fixture in a test, copy it to a temp directory and call
+# config.ParseFile() with the copied path. Do NOT parse this file in-place,
+# as tests should never depend on the repository's working directory layout.
+
 Host *
   User deploy
 
