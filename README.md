@@ -6,7 +6,7 @@ It provides:
 - A TUI dashboard (default command) for browsing hosts, connecting, and toggling tunnels
 - CLI commands for listing hosts and managing tunnel lifecycle
 - SSH config parsing with `Include` support and warning-based graceful degradation
-- Tunnel runtime persistence in your XDG config directory
+- Tunnel runtime persistence inr your XDG config directory
 
 ## Features
 
