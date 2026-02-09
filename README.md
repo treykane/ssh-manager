@@ -1,12 +1,14 @@
 # ssh-manager
 
+Modern SSH config and tunnel manager
+
 `ssh-manager` is a Go terminal app for working with SSH hosts and local forwards from your OpenSSH config.
 
 It provides:
 - A TUI dashboard (default command) for browsing hosts, connecting, and toggling tunnels
 - CLI commands for listing hosts and managing tunnel lifecycle
 - SSH config parsing with `Include` support and warning-based graceful degradation
-- Tunnel runtime persistence inr your XDG config directory
+- Tunnel runtime persistence in your XDG config directory
 
 ## Features
 
@@ -19,7 +21,7 @@ It provides:
 
 ## Requirements
 
-- Go 1.24+
+- Go 1.25+
 - OpenSSH client (`ssh`) available on `PATH`
 
 ## Build
