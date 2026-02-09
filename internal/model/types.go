@@ -98,6 +98,11 @@ type HostEntry struct {
 	// this host. Each entry represents one local-to-remote port forwarding tunnel
 	// that can be started independently.
 	Forwards []ForwardSpec `json:"forwards,omitempty"`
+
+	// IsAdHoc indicates this host was created via the TUI's new connection
+	// configurator for the current session only (not read from ~/.ssh/config).
+	// Ad-hoc hosts require explicit SSH args rather than alias-based resolution.
+	IsAdHoc bool `json:"is_adhoc,omitempty"`
 }
 
 // DisplayTarget returns the hostname for display in the UI and CLI output.

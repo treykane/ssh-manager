@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 
 	"github.com/creack/pty"
 	"github.com/treykane/ssh-manager/internal/model"
@@ -97,7 +98,38 @@ func EnsureSSHBinary() error {
 // This method does NOT start the process; the caller must call Cmd.Start()
 // or Cmd.Run().
 func (c *Client) ConnectCommand(host model.HostEntry) *exec.Cmd {
+	if host.IsAdHoc {
+		return c.ConnectAdHocCommand(host)
+	}
 	args := []string{host.Alias}
+	return exec.Command("ssh", args...)
+}
+
+// ConnectAdHocCommand creates an exec.Cmd for an interactive SSH session
+// using explicit connection parameters rather than relying on ~/.ssh/config
+// alias resolution. This is used for ad-hoc connections created via the TUI
+// that have not been saved to the SSH config file.
+//
+// The command is built as: ssh [-p port] [-i identity] [-J jump] [user@]hostname
+func (c *Client) ConnectAdHocCommand(host model.HostEntry) *exec.Cmd {
+	var args []string
+
+	if host.Port != 0 && host.Port != 22 {
+		args = append(args, "-p", strconv.Itoa(host.Port))
+	}
+	if host.IdentityFile != "" {
+		args = append(args, "-i", host.IdentityFile)
+	}
+	if host.ProxyJump != "" {
+		args = append(args, "-J", host.ProxyJump)
+	}
+
+	dest := host.HostName
+	if host.User != "" {
+		dest = host.User + "@" + host.HostName
+	}
+	args = append(args, dest)
+
 	return exec.Command("ssh", args...)
 }
 

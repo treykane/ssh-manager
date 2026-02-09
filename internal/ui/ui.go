@@ -123,6 +123,14 @@ type dashboardModel struct {
 	// ssh is the SSH client used to create interactive SSH session commands.
 	// Used when the user presses Enter to connect to a host.
 	ssh *sshclient.Client
+
+	// form holds the state for the "new connection" configurator.
+	// nil when the form is not active.
+	form *newConnForm
+
+	// adHocHosts stores session-only hosts created via the form so they
+	// survive config reloads (press 'r').
+	adHocHosts []model.HostEntry
 }
 
 // initialModel creates the initial dashboardModel with loaded configuration,
@@ -169,6 +177,8 @@ func (m *dashboardModel) reloadConfig() {
 	}
 	// Hosts are already sorted alphabetically by the parser.
 	m.hosts = res.Hosts
+	// Merge back session-only ad-hoc hosts so they survive reloads.
+	m.hosts = append(m.hosts, m.adHocHosts...)
 	m.warnings = res.Warnings
 	m.applyFilter()
 	m.tunnels = m.mgr.Snapshot()
@@ -282,6 +292,21 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+		// --- New connection form mode ---
+		if m.form != nil {
+			if msg.String() == "esc" {
+				m.form = nil
+				m.status = "New connection cancelled"
+				return m, nil
+			}
+			result, cmd := m.form.update(msg)
+			if result != nil {
+				m.handleFormResult(result)
+				m.form = nil
+			}
+			return m, cmd
+		}
+
 		// --- Normal mode: process navigation and action keys ---
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -337,6 +362,11 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return statusMsg("ssh session closed")
 			})
+
+		case "n":
+			// Open the new connection configurator form.
+			m.form = newForm()
+			m.status = "New connection: choose Quick Connect or Full Config"
 
 		case "t":
 			// Toggle the first LocalForward tunnel for the selected host.
@@ -491,13 +521,19 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | t toggle tunnel | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | t tunnel | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
-	// renderMainPanels handles responsive layout: side-by-side panels on
-	// wide terminals (>= 96 cols), stacked vertically on narrow ones.
-	main := m.renderMainPanels(left.String(), detail.String())
+	// If the new connection form is open, render it instead of the normal panels.
+	var main string
+	if m.form != nil {
+		main = m.form.view(m.renderPanel, m.effectiveWidth())
+	} else {
+		// renderMainPanels handles responsive layout: side-by-side panels on
+		// wide terminals (>= 96 cols), stacked vertically on narrow ones.
+		main = m.renderMainPanels(left.String(), detail.String())
+	}
 
 	// Render the tunnel table and status bar as full-width panels.
 	tunnels := m.renderPanel("Active Tunnels", tbl.String(), m.effectiveWidth(), lipgloss.Color("63"))
@@ -649,10 +685,37 @@ func (m dashboardModel) helpBlock() string {
 		"  Navigation: j/k or arrow keys move selection.",
 		"  Filtering: press /, type alias/host text, then Enter.",
 		"  Connect: press Enter on selected host.",
+		"  New: press n to configure a new SSH connection.",
 		"  Tunnel: press t toggles the first LocalForward for selected host.",
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",
 	}, "\n")
+}
+
+// handleFormResult processes a completed new-connection form. It either saves
+// the host to ~/.ssh/config and reloads, or adds it as a session-only ad-hoc
+// host to the in-memory list.
+func (m *dashboardModel) handleFormResult(result *formResult) {
+	h := result.host
+
+	if !h.IsAdHoc {
+		// Validate alias before writing.
+		if err := config.ValidateAlias(h.Alias); err != nil {
+			m.status = "Validation error: " + err.Error()
+			return
+		}
+		if err := config.AppendHostEntry(h); err != nil {
+			m.status = "Failed to save to SSH config: " + err.Error()
+			return
+		}
+		m.reloadConfig()
+		m.status = fmt.Sprintf("Saved host %q to ~/.ssh/config", h.Alias)
+	} else {
+		m.adHocHosts = append(m.adHocHosts, h)
+		m.hosts = append(m.hosts, h)
+		m.applyFilter()
+		m.status = fmt.Sprintf("Added session host %q (%s)", h.Alias, h.DisplayTarget())
+	}
 }
 
 // effectiveWidth returns the terminal width to use for layout calculations.

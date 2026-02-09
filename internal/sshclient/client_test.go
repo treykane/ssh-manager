@@ -72,3 +72,93 @@ func TestBuildTunnelArgs(t *testing.T) {
 		t.Fatalf("args mismatch\nwant=%v\n got=%v", want, args)
 	}
 }
+
+// TestConnectAdHocCommand verifies that ConnectAdHocCommand produces the correct
+// SSH command-line arguments for ad-hoc connections with explicit parameters.
+func TestConnectAdHocCommand(t *testing.T) {
+	c := New()
+
+	tests := []struct {
+		name string
+		host model.HostEntry
+		want []string
+	}{
+		{
+			name: "hostname only",
+			host: model.HostEntry{HostName: "example.com", Port: 22, IsAdHoc: true},
+			want: []string{"ssh", "example.com"},
+		},
+		{
+			name: "user and hostname",
+			host: model.HostEntry{HostName: "example.com", User: "deploy", Port: 22, IsAdHoc: true},
+			want: []string{"ssh", "deploy@example.com"},
+		},
+		{
+			name: "custom port",
+			host: model.HostEntry{HostName: "example.com", User: "deploy", Port: 2222, IsAdHoc: true},
+			want: []string{"ssh", "-p", "2222", "deploy@example.com"},
+		},
+		{
+			name: "with identity file",
+			host: model.HostEntry{
+				HostName: "example.com", User: "admin", Port: 22,
+				IdentityFile: "~/.ssh/id_ed25519", IsAdHoc: true,
+			},
+			want: []string{"ssh", "-i", "~/.ssh/id_ed25519", "admin@example.com"},
+		},
+		{
+			name: "with proxy jump",
+			host: model.HostEntry{
+				HostName: "internal.server", User: "admin", Port: 22,
+				ProxyJump: "bastion", IsAdHoc: true,
+			},
+			want: []string{"ssh", "-J", "bastion", "admin@internal.server"},
+		},
+		{
+			name: "all options",
+			host: model.HostEntry{
+				HostName: "internal.server", User: "admin", Port: 2222,
+				IdentityFile: "~/.ssh/key", ProxyJump: "bastion", IsAdHoc: true,
+			},
+			want: []string{"ssh", "-p", "2222", "-i", "~/.ssh/key", "-J", "bastion", "admin@internal.server"},
+		},
+		{
+			name: "no user",
+			host: model.HostEntry{HostName: "server.local", Port: 2222, IsAdHoc: true},
+			want: []string{"ssh", "-p", "2222", "server.local"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd := c.ConnectAdHocCommand(tt.host)
+			got := cmd.Args
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("args mismatch\nwant=%v\n got=%v", tt.want, got)
+			}
+		})
+	}
+}
+
+// TestConnectCommandDispatch verifies that ConnectCommand dispatches to
+// ConnectAdHocCommand when IsAdHoc is true and uses alias-based connection
+// when IsAdHoc is false.
+func TestConnectCommandDispatch(t *testing.T) {
+	c := New()
+
+	// Config-based host: should use alias only.
+	configHost := model.HostEntry{Alias: "prod-db", HostName: "db.example.com", Port: 22}
+	cmd := c.ConnectCommand(configHost)
+	wantConfig := []string{"ssh", "prod-db"}
+	if !reflect.DeepEqual(cmd.Args, wantConfig) {
+		t.Fatalf("config host args mismatch\nwant=%v\n got=%v", wantConfig, cmd.Args)
+	}
+
+	// Ad-hoc host: should use explicit args.
+	adHocHost := model.HostEntry{HostName: "db.example.com", User: "root", Port: 22, IsAdHoc: true}
+	cmd = c.ConnectCommand(adHocHost)
+	wantAdHoc := []string{"ssh", "root@db.example.com"}
+	if !reflect.DeepEqual(cmd.Args, wantAdHoc) {
+		t.Fatalf("ad-hoc host args mismatch\nwant=%v\n got=%v", wantAdHoc, cmd.Args)
+	}
+}
