@@ -31,6 +31,32 @@ type UIConfig struct {
 	RefreshSeconds int `yaml:"refresh_seconds"`
 }
 
+const (
+	BindPolicyLoopbackOnly = "loopback-only"
+	BindPolicyAllowPublic  = "allow-public"
+
+	HostKeyPolicyStrict    = "strict"
+	HostKeyPolicyAcceptNew = "accept-new"
+	HostKeyPolicyInsecure  = "insecure"
+)
+
+// SecurityConfig controls transport and tunnel safety defaults.
+type SecurityConfig struct {
+	// BindPolicy controls whether local tunnel binds may use public interfaces.
+	// Allowed values: loopback-only, allow-public.
+	BindPolicy string `yaml:"bind_policy"`
+
+	// HostKeyPolicy controls SSH host key verification behavior.
+	// Allowed values: strict, accept-new, insecure.
+	HostKeyPolicy string `yaml:"host_key_policy"`
+
+	// AuditLogEnabled reserves an opt-in switch for security audit logging.
+	AuditLogEnabled bool `yaml:"audit_log_enabled"`
+
+	// RedactErrors strips home paths and .ssh details from user-facing errors.
+	RedactErrors bool `yaml:"redact_errors"`
+}
+
 // Config holds the top-level application configuration, loaded from config.yaml.
 // Fields map directly to YAML keys for straightforward editing by users.
 type Config struct {
@@ -41,6 +67,9 @@ type Config struct {
 
 	// UI contains TUI-specific display and refresh settings.
 	UI UIConfig `yaml:"ui"`
+
+	// Security contains app-wide security behavior defaults.
+	Security SecurityConfig `yaml:"security"`
 }
 
 // Default returns the default configuration values. These are used when:
@@ -54,6 +83,32 @@ func Default() Config {
 	return Config{
 		DefaultHealthCommand: "uptime",
 		UI:                   UIConfig{RefreshSeconds: 3},
+		Security: SecurityConfig{
+			BindPolicy:      BindPolicyLoopbackOnly,
+			HostKeyPolicy:   HostKeyPolicyStrict,
+			AuditLogEnabled: false,
+			RedactErrors:    true,
+		},
+	}
+}
+
+func NormalizeBindPolicy(policy string) string {
+	switch policy {
+	case BindPolicyAllowPublic:
+		return BindPolicyAllowPublic
+	default:
+		return BindPolicyLoopbackOnly
+	}
+}
+
+func NormalizeHostKeyPolicy(policy string) string {
+	switch policy {
+	case HostKeyPolicyAcceptNew:
+		return HostKeyPolicyAcceptNew
+	case HostKeyPolicyInsecure:
+		return HostKeyPolicyInsecure
+	default:
+		return HostKeyPolicyStrict
 	}
 }
 
@@ -105,7 +160,7 @@ func Load() (Config, error) {
 	}
 
 	// Ensure the config directory exists before attempting to read or write.
-	if err := os.MkdirAll(d, 0o755); err != nil {
+	if err := os.MkdirAll(d, 0o700); err != nil {
 		return Config{}, err
 	}
 
@@ -140,6 +195,8 @@ func Load() (Config, error) {
 	if cfg.DefaultHealthCommand == "" {
 		cfg.DefaultHealthCommand = "uptime"
 	}
+	cfg.Security.BindPolicy = NormalizeBindPolicy(cfg.Security.BindPolicy)
+	cfg.Security.HostKeyPolicy = NormalizeHostKeyPolicy(cfg.Security.HostKeyPolicy)
 
 	return cfg, nil
 }
@@ -147,14 +204,13 @@ func Load() (Config, error) {
 // Save writes the given Config to config.yaml in the configuration directory.
 // The config directory is created (with parents) if it doesn't already exist.
 //
-// The file is written with 0644 permissions (owner read/write, group/other read)
-// since it contains no sensitive data (secrets like SSH keys are managed by OpenSSH).
+// The file is written with 0600 permissions to keep local policy settings private.
 func Save(cfg Config) error {
 	d, err := ConfigDir()
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(d, 0o755); err != nil {
+	if err := os.MkdirAll(d, 0o700); err != nil {
 		return err
 	}
 	path := filepath.Join(d, "config.yaml")
@@ -162,5 +218,5 @@ func Save(cfg Config) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	return os.WriteFile(path, b, 0o600)
 }

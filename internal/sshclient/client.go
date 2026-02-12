@@ -31,6 +31,7 @@ import (
 	"strconv"
 
 	"github.com/creack/pty"
+	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/util"
 )
@@ -60,13 +61,22 @@ type TunnelProcess struct {
 // can be running simultaneously.
 //
 // The zero value is not useful; use New() to create a Client instance.
-type Client struct{}
+type Client struct {
+	hostKeyPolicy string
+}
 
 // New creates a new SSH client.
 //
 // The returned client is lightweight (no resources are allocated until methods
 // are called) and can be reused for the lifetime of the application.
-func New() *Client { return &Client{} }
+func New() *Client {
+	return &Client{hostKeyPolicy: appconfig.HostKeyPolicyStrict}
+}
+
+// SetHostKeyPolicy configures how host key verification options are passed to ssh.
+func (c *Client) SetHostKeyPolicy(policy string) {
+	c.hostKeyPolicy = appconfig.NormalizeHostKeyPolicy(policy)
+}
 
 // EnsureSSHBinary checks that the "ssh" binary is available on the system PATH.
 //
@@ -101,7 +111,7 @@ func (c *Client) ConnectCommand(host model.HostEntry) *exec.Cmd {
 	if host.IsAdHoc {
 		return c.ConnectAdHocCommand(host)
 	}
-	args := []string{host.Alias}
+	args := append(c.hostKeyArgs(), host.Alias)
 	return exec.Command("ssh", args...)
 }
 
@@ -113,6 +123,7 @@ func (c *Client) ConnectCommand(host model.HostEntry) *exec.Cmd {
 // The command is built as: ssh [-p port] [-i identity] [-J jump] [user@]hostname
 func (c *Client) ConnectAdHocCommand(host model.HostEntry) *exec.Cmd {
 	var args []string
+	args = append(args, c.hostKeyArgs()...)
 
 	if host.Port != 0 && host.Port != 22 {
 		args = append(args, "-p", strconv.Itoa(host.Port))
@@ -219,6 +230,9 @@ func (c *Client) StartTunnel(ctx context.Context, host model.HostEntry, fwd mode
 	// "localhost" for remote) when the ForwardSpec has empty address fields.
 	args := []string{
 		"-N",
+	}
+	args = append(args, c.hostKeyArgs()...)
+	args = append(args,
 		"-L",
 		fmt.Sprintf("%s:%d:%s:%d",
 			util.NormalizeAddr(fwd.LocalAddr, "127.0.0.1"),
@@ -227,7 +241,7 @@ func (c *Client) StartTunnel(ctx context.Context, host model.HostEntry, fwd mode
 			fwd.RemotePort,
 		),
 		host.Alias,
-	}
+	)
 
 	// Use CommandContext so that cancelling the context automatically sends
 	// a kill signal to the SSH process. This ties the tunnel's lifetime to
@@ -266,8 +280,11 @@ func (c *Client) StartTunnel(ctx context.Context, host model.HostEntry, fwd mode
 //
 // Example output: ["-N", "-L", "127.0.0.1:8080:localhost:80", "prod-db"]
 func (c *Client) BuildTunnelArgs(hostAlias string, fwd model.ForwardSpec) []string {
-	return []string{
+	args := []string{
 		"-N",
+	}
+	args = append(args, c.hostKeyArgs()...)
+	args = append(args,
 		"-L",
 		fmt.Sprintf("%s:%d:%s:%d",
 			util.NormalizeAddr(fwd.LocalAddr, "127.0.0.1"),
@@ -276,5 +293,17 @@ func (c *Client) BuildTunnelArgs(hostAlias string, fwd model.ForwardSpec) []stri
 			fwd.RemotePort,
 		),
 		hostAlias,
+	)
+	return args
+}
+
+func (c *Client) hostKeyArgs() []string {
+	switch c.hostKeyPolicy {
+	case appconfig.HostKeyPolicyAcceptNew:
+		return []string{"-o", "StrictHostKeyChecking=accept-new"}
+	case appconfig.HostKeyPolicyInsecure:
+		return []string{"-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null"}
+	default:
+		return nil
 	}
 }

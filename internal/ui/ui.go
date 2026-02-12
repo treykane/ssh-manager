@@ -43,6 +43,7 @@ import (
 	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/config"
 	"github.com/treykane/ssh-manager/internal/model"
+	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 	"github.com/treykane/ssh-manager/internal/tunnel"
 	"github.com/treykane/ssh-manager/internal/util"
@@ -151,6 +152,9 @@ func initialModel() dashboardModel {
 
 	ssh := sshclient.New()
 	mgr := tunnel.NewManager(ssh)
+	mgr.SetBindPolicy(cfg.Security.BindPolicy)
+	mgr.SetRedactErrors(cfg.Security.RedactErrors)
+	ssh.SetHostKeyPolicy(cfg.Security.HostKeyPolicy)
 
 	// Restore tunnel state from a previous session. If the runtime file
 	// doesn't exist or can't be read, we proceed with an empty state.
@@ -160,7 +164,7 @@ func initialModel() dashboardModel {
 
 	m := dashboardModel{cfg: cfg, mgr: mgr, ssh: ssh}
 	m.reloadConfig()
-	m.status = "Ready. Select a host, then Enter to connect or t to manage its first tunnel."
+	m.status = "Ready. Select a host, Enter to connect, t for first tunnel, T for all."
 	return m
 }
 
@@ -358,7 +362,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd := m.ssh.ConnectCommand(h)
 			return m, tea.ExecProcess(cmd, func(err error) tea.Msg {
 				if err != nil {
-					return statusMsg("ssh exited: " + err.Error())
+					return statusMsg("ssh exited: " + security.UserMessage(err, m.cfg.Security.RedactErrors))
 				}
 				return statusMsg("ssh session closed")
 			})
@@ -386,26 +390,44 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Use the first forward for the toggle action. Users who need
 			// to manage specific forwards can use the CLI:
 			//   ssh-manager tunnel up <host> --forward <index>
-			fwd := h.Forwards[0]
-			id := tunnel.RuntimeID(h.Alias, fwd)
+			m.status = m.toggleForward(h, 0)
+			m.tunnels = m.mgr.Snapshot()
 
-			// Determine current tunnel state to decide whether to start or stop.
-			rt, err := m.mgr.Get(id)
-			if err == nil && (rt.State == model.TunnelUp || rt.State == model.TunnelStarting) {
-				// Tunnel is active — stop it.
-				_ = m.mgr.Stop(id)
-				m.status = "Tunnel stopped: " + id
-			} else {
-				// Tunnel is not active — start it.
-				newRT, serr := m.mgr.Start(h, fwd)
-				if serr != nil {
-					m.status = "Tunnel start failed: " + serr.Error()
-				} else {
-					m.status = fmt.Sprintf("Tunnel started: %s (pid=%d)", newRT.ID, newRT.PID)
+		case "T":
+			if len(m.filtered) == 0 {
+				break
+			}
+			h := m.filtered[m.sel]
+			if len(h.Forwards) == 0 {
+				m.status = "No LocalForward entries for host " + h.Alias
+				break
+			}
+			stopped := 0
+			started := 0
+			for i := range h.Forwards {
+				status := m.toggleForward(h, i)
+				if strings.HasPrefix(status, "Tunnel stopped:") {
+					stopped++
+				}
+				if strings.HasPrefix(status, "Tunnel started:") {
+					started++
 				}
 			}
+			m.status = fmt.Sprintf("Processed %d forwards for %s (started=%d, stopped=%d)", len(h.Forwards), h.Alias, started, stopped)
+			m.tunnels = m.mgr.Snapshot()
 
-			// Refresh tunnel snapshot immediately so the UI reflects the change.
+		case "R":
+			if len(m.filtered) == 0 {
+				break
+			}
+			h := m.filtered[m.sel]
+			if len(h.Forwards) == 0 {
+				m.status = "No LocalForward entries for host " + h.Alias
+				break
+			}
+			id := tunnel.RuntimeID(h.Alias, h.Forwards[0])
+			_ = m.mgr.Stop(id)
+			m.status = m.toggleForward(h, 0)
 			m.tunnels = m.mgr.Snapshot()
 		}
 
@@ -521,7 +543,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | t tunnel | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | t first tunnel | T all tunnels | R restart first | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -637,6 +659,7 @@ func (m dashboardModel) guidanceForHost(h model.HostEntry) string {
 	} else {
 		lines = append(lines, "  - Press t to start the first LocalForward tunnel.")
 	}
+	lines = append(lines, "  - Press T to process all forwards, or R to restart the first forward.")
 
 	// If the host has multiple forwards, hint that the CLI can target specific ones.
 	if len(h.Forwards) > 1 {
@@ -686,10 +709,28 @@ func (m dashboardModel) helpBlock() string {
 		"  Filtering: press /, type alias/host text, then Enter.",
 		"  Connect: press Enter on selected host.",
 		"  New: press n to configure a new SSH connection.",
-		"  Tunnel: press t toggles the first LocalForward for selected host.",
+		"  Tunnel: t toggles first forward; T processes all forwards; R restarts first forward.",
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",
 	}, "\n")
+}
+
+func (m *dashboardModel) toggleForward(host model.HostEntry, idx int) string {
+	if idx < 0 || idx >= len(host.Forwards) {
+		return "Tunnel index out of range"
+	}
+	fwd := host.Forwards[idx]
+	id := tunnel.RuntimeID(host.Alias, fwd)
+	rt, err := m.mgr.Get(id)
+	if err == nil && (rt.State == model.TunnelUp || rt.State == model.TunnelStarting) {
+		_ = m.mgr.Stop(id)
+		return "Tunnel stopped: " + id
+	}
+	newRT, serr := m.mgr.Start(host, fwd)
+	if serr != nil {
+		return "Tunnel start failed: " + security.UserMessage(serr, m.cfg.Security.RedactErrors)
+	}
+	return fmt.Sprintf("Tunnel started: %s (pid=%d)", newRT.ID, newRT.PID)
 }
 
 // handleFormResult processes a completed new-connection form. It either saves
@@ -701,11 +742,11 @@ func (m *dashboardModel) handleFormResult(result *formResult) {
 	if !h.IsAdHoc {
 		// Validate alias before writing.
 		if err := config.ValidateAlias(h.Alias); err != nil {
-			m.status = "Validation error: " + err.Error()
+			m.status = "Validation error: " + security.UserMessage(err, m.cfg.Security.RedactErrors)
 			return
 		}
 		if err := config.AppendHostEntry(h); err != nil {
-			m.status = "Failed to save to SSH config: " + err.Error()
+			m.status = "Failed to save to SSH config: " + security.UserMessage(err, m.cfg.Security.RedactErrors)
 			return
 		}
 		m.reloadConfig()

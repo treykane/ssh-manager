@@ -13,6 +13,8 @@ This file gives coding agents project-specific guidance for working in this repo
   - Parse `~/.ssh/config` (with `Include`)
   - Connect to hosts using system `ssh`
   - Start/stop/inspect SSH tunnels from `LocalForward`
+  - Enforce tunnel security policy defaults (`loopback-only` bind, strict host key policy)
+  - Run local security posture checks via `ssh-manager security audit`
 
 ## Current Code Layout
 - Entry point:
@@ -87,6 +89,7 @@ This file gives coding agents project-specific guidance for working in this repo
 - Tunnel runtime persistence currently stores state in XDG config dir (`runtime.json`).
 - No persistent daemon mode (by design for v1).
 - Group health-check split view is not fully implemented yet.
+- Runtime recovery quarantines suspicious stale process metadata rather than trusting it blindly.
 
 ## If You Add Features
 - Keep CLI and TUI behaviors aligned (shared backend logic, not duplicated business rules).

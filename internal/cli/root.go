@@ -31,8 +31,10 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/config"
 	"github.com/treykane/ssh-manager/internal/model"
+	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 	"github.com/treykane/ssh-manager/internal/tunnel"
 	"github.com/treykane/ssh-manager/internal/ui"
@@ -64,6 +66,7 @@ func NewRootCommand() *cobra.Command {
 
 	root.AddCommand(newListCmd())
 	root.AddCommand(newTunnelCmd())
+	root.AddCommand(newSecurityCmd())
 	return root
 }
 
@@ -133,6 +136,14 @@ func newTunnelCmd() *cobra.Command {
 	// Create a shared SSH client and tunnel manager for all tunnel subcommands.
 	client := sshclient.New()
 	mgr := tunnel.NewManager(client)
+	cfg, cfgErr := appconfig.Load()
+	if cfgErr != nil {
+		slog.Warn("failed to load config, using defaults", "error", cfgErr)
+		cfg = appconfig.Default()
+	}
+	mgr.SetBindPolicy(cfg.Security.BindPolicy)
+	mgr.SetRedactErrors(cfg.Security.RedactErrors)
+	client.SetHostKeyPolicy(cfg.Security.HostKeyPolicy)
 
 	// Restore persisted tunnel state from disk. This allows "tunnel status" to
 	// show tunnels that were started in a previous session (if their processes
@@ -150,6 +161,8 @@ func newTunnelCmd() *cobra.Command {
 	//   - A numeric index (0-based): start a specific forward from the host's config.
 	//   - An explicit spec like "8080:localhost:80": define a forward on the fly.
 	var forwardArg string
+	var allowPublicBind bool
+	var hostKeyPolicy string
 
 	up := &cobra.Command{
 		Use:   "up <host>",
@@ -174,12 +187,14 @@ func newTunnelCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			mgr.SetAllowPublicBind(allowPublicBind)
+			client.SetHostKeyPolicy(effectiveHostKeyPolicy(cfg, hostKeyPolicy))
 
 			// Start each resolved forward as a separate tunnel.
 			for _, fwd := range forwards {
 				rt, err := mgr.Start(host, fwd)
 				if err != nil {
-					return err
+					return fmt.Errorf("%s", security.UserMessage(err, cfg.Security.RedactErrors))
 				}
 				fmt.Printf("started %s pid=%d %s -> %s\n", rt.ID, rt.PID, rt.Local, rt.Remote)
 			}
@@ -187,6 +202,8 @@ func newTunnelCmd() *cobra.Command {
 		},
 	}
 	up.Flags().StringVar(&forwardArg, "forward", "", "forward index (0-based) or explicit spec localPort:remoteHost:remotePort")
+	up.Flags().BoolVar(&allowPublicBind, "allow-public-bind", false, "allow 0.0.0.0/:: local binds for this command")
+	up.Flags().StringVar(&hostKeyPolicy, "host-key-policy", "", "host key policy override: strict, accept-new, insecure")
 
 	// --- tunnel down ---------------------------------------------------------
 
@@ -219,6 +236,66 @@ func newTunnelCmd() *cobra.Command {
 			return nil
 		},
 	}
+
+	restart := &cobra.Command{
+		Use:   "restart <tunnel-id|host>",
+		Short: "Restart a tunnel by id or restart all tunnels for host",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			idOrHost := args[0]
+			sn := mgr.Snapshot()
+			sort.Slice(sn, func(i, j int) bool { return sn[i].ID < sn[j].ID })
+
+			var targets []model.TunnelRuntime
+			if strings.Contains(idOrHost, "|") {
+				for _, rt := range sn {
+					if rt.ID == idOrHost {
+						targets = append(targets, rt)
+						break
+					}
+				}
+			} else {
+				for _, rt := range sn {
+					if rt.HostAlias == idOrHost {
+						targets = append(targets, rt)
+					}
+				}
+			}
+			if len(targets) == 0 {
+				return fmt.Errorf("no tunnels found for %s", idOrHost)
+			}
+
+			hostCache := map[string]model.HostEntry{}
+			for _, rt := range targets {
+				if err := mgr.Stop(rt.ID); err != nil {
+					return err
+				}
+				host, ok := hostCache[rt.HostAlias]
+				if !ok {
+					var err error
+					host, err = findHost(rt.HostAlias)
+					if err != nil {
+						return err
+					}
+					hostCache[rt.HostAlias] = host
+				}
+				mgr.SetAllowPublicBind(allowPublicBind)
+				client.SetHostKeyPolicy(effectiveHostKeyPolicy(cfg, hostKeyPolicy))
+				forward, ferr := forwardFromRuntime(rt)
+				if ferr != nil {
+					return ferr
+				}
+				next, err := mgr.Start(host, forward)
+				if err != nil {
+					return fmt.Errorf("%s", security.UserMessage(err, cfg.Security.RedactErrors))
+				}
+				fmt.Printf("restarted %s pid=%d\n", next.ID, next.PID)
+			}
+			return nil
+		},
+	}
+	restart.Flags().BoolVar(&allowPublicBind, "allow-public-bind", false, "allow 0.0.0.0/:: local binds for this command")
+	restart.Flags().StringVar(&hostKeyPolicy, "host-key-policy", "", "host key policy override: strict, accept-new, insecure")
 
 	// --- tunnel status -------------------------------------------------------
 
@@ -255,8 +332,20 @@ func newTunnelCmd() *cobra.Command {
 	}
 	status.Flags().BoolVar(&jsonOut, "json", false, "output JSON")
 
-	root.AddCommand(up, down, status)
+	root.AddCommand(up, down, status, restart)
 	return root
+}
+
+func forwardFromRuntime(rt model.TunnelRuntime) (model.ForwardSpec, error) {
+	if rt.Forward.LocalPort > 0 && rt.Forward.RemotePort > 0 {
+		return rt.Forward, nil
+	}
+	// Rehydrate from stable local/remote endpoint strings loaded from runtime.json.
+	fwd, err := tunnel.ParseForwardArg(fmt.Sprintf("%s:%s", rt.Local, rt.Remote))
+	if err != nil {
+		return model.ForwardSpec{}, fmt.Errorf("cannot reconstruct forward for %s: %w", rt.ID, err)
+	}
+	return fwd, nil
 }
 
 // findHost looks up a host entry by its alias in the user's SSH config.
@@ -338,4 +427,46 @@ func ConnectOnce(host model.HostEntry) error {
 	defer cancel()
 	c := sshclient.New()
 	return c.RunInteractive(ctx, host)
+}
+
+func effectiveHostKeyPolicy(cfg appconfig.Config, override string) string {
+	if strings.TrimSpace(override) != "" {
+		return appconfig.NormalizeHostKeyPolicy(strings.TrimSpace(override))
+	}
+	return cfg.Security.HostKeyPolicy
+}
+
+func newSecurityCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "security",
+		Short: "Security checks and local posture tools",
+	}
+	audit := &cobra.Command{
+		Use:   "audit",
+		Short: "Run a local security audit",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := security.RunLocalAudit()
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(report)
+			}
+			if len(report.Findings) == 0 {
+				fmt.Println("No security findings.")
+				return nil
+			}
+			fmt.Printf("%-8s %-34s %-36s %s\n", "SEV", "TARGET", "MESSAGE", "RECOMMENDATION")
+			for _, f := range report.Findings {
+				fmt.Printf("%-8s %-34s %-36s %s\n", strings.ToUpper(string(f.Severity)), f.Target, f.Message, f.Recommendation)
+			}
+			return nil
+		},
+	}
+	audit.Flags().BoolVar(&jsonOut, "json", false, "output JSON")
+	cmd.AddCommand(audit)
+	return cmd
 }

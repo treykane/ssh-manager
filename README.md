@@ -150,7 +150,32 @@ Stop **all** active tunnels for a host:
 ./ssh-manager tunnel status --json
 ```
 
+<<<<<<< HEAD
 #### JSON Schema
+=======
+Restart tunnel(s):
+
+```bash
+./ssh-manager tunnel restart '<host>|127.0.0.1:15432|localhost:5432'
+./ssh-manager tunnel restart <host>
+```
+
+Security controls for tunnel startup:
+
+```bash
+./ssh-manager tunnel up <host> --host-key-policy accept-new
+./ssh-manager tunnel up <host> --allow-public-bind
+```
+
+Run security audit:
+
+```bash
+./ssh-manager security audit
+./ssh-manager security audit --json
+```
+
+## `tunnel status --json` schema
+>>>>>>> 220769d (Security focused enhancements)
 
 The `--json` output contains these stable fields per tunnel:
 
@@ -166,7 +191,20 @@ The `--json` output contains these stable fields per tunnel:
 | `latency_ms`     | Last measured latency              |
 | `last_error`     | Most recent error message, if any  |
 
+<<<<<<< HEAD
 ---
+=======
+In dashboard mode:
+- `j` / `k` or arrow keys: move selection
+- `Enter`: open interactive SSH session to selected host
+- `t`: toggle first `LocalForward` tunnel for selected host
+- `T`: process all `LocalForward` entries for selected host
+- `R`: restart first `LocalForward` tunnel for selected host
+- `/`: filter mode
+- `r`: reload SSH config and tunnel snapshot
+- `?`: toggle help block
+- `q` / `Ctrl+C`: quit (stops managed tunnels)
+>>>>>>> 220769d (Security focused enhancements)
 
 ## Configuration
 
@@ -190,6 +228,11 @@ $XDG_CONFIG_HOME/ssh-manager/     # if XDG_CONFIG_HOME is set
 default_health_command: uptime
 ui:
   refresh_seconds: 3
+security:
+  bind_policy: loopback-only
+  host_key_policy: strict
+  audit_log_enabled: false
+  redact_errors: true
 ```
 
 ---

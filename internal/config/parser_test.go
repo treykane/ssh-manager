@@ -139,3 +139,50 @@ func TestParseFile_IncludeAndMalformed(t *testing.T) {
 		t.Fatal("expected warning for malformed line")
 	}
 }
+
+func TestParseFile_LocalForwardBracketedIPv6(t *testing.T) {
+	d := t.TempDir()
+	path := filepath.Join(d, "config")
+	cfg := `
+Host db
+  HostName db.internal
+  LocalForward [::1]:8080 [2001:db8::1]:5432
+`
+	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hosts) != 1 || len(res.Hosts[0].Forwards) != 1 {
+		t.Fatalf("expected one host with one forward, got %+v", res.Hosts)
+	}
+	fwd := res.Hosts[0].Forwards[0]
+	if fwd.LocalAddr != "::1" || fwd.RemoteAddr != "2001:db8::1" {
+		t.Fatalf("unexpected forward parse: %+v", fwd)
+	}
+}
+
+func TestParseFile_LocalForwardRejectsUnbracketedIPv6(t *testing.T) {
+	d := t.TempDir()
+	path := filepath.Join(d, "config")
+	cfg := `
+Host db
+  HostName db.internal
+  LocalForward ::1:8080 localhost:5432
+`
+	if err := os.WriteFile(path, []byte(cfg), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	res, err := ParseFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.Hosts) != 1 {
+		t.Fatalf("expected one host, got %d", len(res.Hosts))
+	}
+	if len(res.Hosts[0].Forwards) != 0 {
+		t.Fatalf("expected invalid forward to be skipped, got %+v", res.Hosts[0].Forwards)
+	}
+}

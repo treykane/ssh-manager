@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -49,6 +50,7 @@ import (
 
 	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/model"
+	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 	"github.com/treykane/ssh-manager/internal/util"
 )
@@ -88,6 +90,15 @@ type Manager struct {
 	// to kill the SSH process. Entries are removed when the tunnel stops
 	// or the process exits naturally.
 	cancel map[string]context.CancelFunc
+
+	// bindPolicy determines whether local forwards may bind non-loopback addresses.
+	bindPolicy string
+
+	// allowPublicBind permits one-off non-loopback binds (CLI override).
+	allowPublicBind bool
+
+	// redactErrors controls whether stored/displayed errors should hide home paths.
+	redactErrors bool
 }
 
 // TunnelStarter abstracts SSH tunnel process creation for testing.
@@ -108,10 +119,24 @@ type TunnelStarter interface {
 // restore any previously persisted tunnel state from disk.
 func NewManager(client TunnelStarter) *Manager {
 	return &Manager{
-		client:  client,
-		runtime: make(map[string]model.TunnelRuntime),
-		cancel:  make(map[string]context.CancelFunc),
+		client:       client,
+		runtime:      make(map[string]model.TunnelRuntime),
+		cancel:       make(map[string]context.CancelFunc),
+		bindPolicy:   appconfig.BindPolicyLoopbackOnly,
+		redactErrors: true,
 	}
+}
+
+func (m *Manager) SetBindPolicy(policy string) {
+	m.bindPolicy = appconfig.NormalizeBindPolicy(policy)
+}
+
+func (m *Manager) SetAllowPublicBind(allow bool) {
+	m.allowPublicBind = allow
+}
+
+func (m *Manager) SetRedactErrors(redact bool) {
+	m.redactErrors = redact
 }
 
 // RuntimeID generates a unique, deterministic identifier for a tunnel based on
@@ -146,12 +171,26 @@ func RuntimeID(hostAlias string, fwd model.ForwardSpec) string {
 // Returns the TunnelRuntime record for the tunnel (which may be in "error" state
 // if the SSH process failed to start) and any error from the start attempt.
 func (m *Manager) Start(host model.HostEntry, fwd model.ForwardSpec) (model.TunnelRuntime, error) {
+	defer func() {
+		// One-off override is consumed by a single start attempt.
+		m.allowPublicBind = false
+	}()
+
 	// Validate that both local and remote ports are in the valid TCP range (1-65535).
 	if err := util.ValidatePort(fwd.LocalPort); err != nil {
 		return model.TunnelRuntime{}, fmt.Errorf("invalid local port: %w", err)
 	}
 	if err := util.ValidatePort(fwd.RemotePort); err != nil {
 		return model.TunnelRuntime{}, fmt.Errorf("invalid remote port: %w", err)
+	}
+	if err := validateForwardSpec(fwd); err != nil {
+		return model.TunnelRuntime{}, security.NewClassifiedError("invalid forward specification", err.Error())
+	}
+	if m.bindPolicy == appconfig.BindPolicyLoopbackOnly && !m.allowPublicBind && isPublicBindAddr(fwd.LocalAddr) {
+		return model.TunnelRuntime{}, security.NewClassifiedError(
+			"public bind rejected by security policy",
+			fmt.Sprintf("local bind address %q requires allow-public override", fwd.LocalAddr),
+		)
 	}
 
 	id := RuntimeID(host.Alias, fwd)
@@ -191,7 +230,7 @@ func (m *Manager) Start(host model.HostEntry, fwd model.ForwardSpec) (model.Tunn
 		// error message so it can be displayed in the UI or CLI output.
 		m.mu.Lock()
 		rt.State = model.TunnelError
-		rt.LastError = err.Error()
+		rt.LastError = security.UserMessage(err, m.redactErrors)
 		m.runtime[id] = rt
 		delete(m.cancel, id) // No process to cancel; clean up the cancel func.
 		m.mu.Unlock()
@@ -199,7 +238,7 @@ func (m *Manager) Start(host model.HostEntry, fwd model.ForwardSpec) (model.Tunn
 		if persistErr := m.persist(); persistErr != nil {
 			slog.Warn("failed to persist tunnel state after start error", "error", persistErr)
 		}
-		return rt, err
+		return rt, security.NewClassifiedError("failed to start tunnel", security.DebugMessage(err))
 	}
 
 	// Process started successfully — record the PID and transition to "up" state.
@@ -252,7 +291,7 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 	if rt.State != model.TunnelStopping {
 		if err != nil {
 			rt.State = model.TunnelError
-			rt.LastError = err.Error()
+			rt.LastError = security.UserMessage(err, m.redactErrors)
 		} else {
 			rt.State = model.TunnelDown
 		}
@@ -535,8 +574,18 @@ func (m *Manager) LoadRuntime() error {
 	defer m.mu.Unlock()
 	for _, rt := range arr {
 		if rt.PID > 0 && processAlive(rt.PID) {
-			// The process from a previous session is still running.
-			// Preserve its state so the UI can display it.
+			cmdline, cmdErr := processCommand(rt.PID)
+			if cmdErr == nil && isManagedTunnelProcess(cmdline, rt) {
+				// The process from a previous session is still running and appears
+				// to be one of our managed tunnel commands.
+				m.runtime[rt.ID] = rt
+				continue
+			}
+
+			// Process is alive but cannot be confidently attributed to this tunnel.
+			rt.State = model.TunnelQuarantined
+			rt.LastError = "recovered runtime entry was quarantined (process mismatch)"
+			rt.PID = 0
 			m.runtime[rt.ID] = rt
 		} else {
 			// The process is dead — mark the tunnel as down so the UI
@@ -613,63 +662,171 @@ func (m *Manager) persist() error {
 // This is used by the "tunnel up" CLI command when the user provides an explicit
 // --forward argument instead of using a forward from the SSH config.
 func ParseForwardArg(s string) (model.ForwardSpec, error) {
-	parts := strings.Split(s, ":")
-
-	// Three-part format: localPort:remoteHost:remotePort
-	// Example: "8080:localhost:80"
-	if len(parts) == 3 {
-		lp, err := strconv.Atoi(parts[0])
-		if err != nil {
-			return model.ForwardSpec{}, fmt.Errorf("invalid local port: %w", err)
-		}
-		if err := util.ValidatePort(lp); err != nil {
-			return model.ForwardSpec{}, err
-		}
-
-		rp, err := strconv.Atoi(parts[2])
-		if err != nil {
-			return model.ForwardSpec{}, fmt.Errorf("invalid remote port: %w", err)
-		}
-		if err := util.ValidatePort(rp); err != nil {
-			return model.ForwardSpec{}, err
-		}
-
-		return model.ForwardSpec{
-			LocalAddr:  "127.0.0.1",
-			LocalPort:  lp,
-			RemoteAddr: parts[1],
-			RemotePort: rp,
-		}, nil
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return model.ForwardSpec{}, fmt.Errorf("forward cannot be empty")
 	}
 
-	// Four-part format: localAddr:localPort:remoteHost:remotePort
-	// Example: "0.0.0.0:8080:db.internal:5432"
-	if len(parts) == 4 {
-		lp, err := strconv.Atoi(parts[1])
-		if err != nil {
-			return model.ForwardSpec{}, fmt.Errorf("invalid local port: %w", err)
-		}
-		if err := util.ValidatePort(lp); err != nil {
-			return model.ForwardSpec{}, err
-		}
-
-		rp, err := strconv.Atoi(parts[3])
-		if err != nil {
-			return model.ForwardSpec{}, fmt.Errorf("invalid remote port: %w", err)
-		}
-		if err := util.ValidatePort(rp); err != nil {
-			return model.ForwardSpec{}, err
-		}
-
-		return model.ForwardSpec{
-			LocalAddr:  parts[0],
-			LocalPort:  lp,
-			RemoteAddr: parts[2],
-			RemotePort: rp,
-		}, nil
+	// Parse from right to left so remote host may be bracketed IPv6.
+	remoteAddr, remotePort, rest, err := parseAddrPortTail(s)
+	if err != nil {
+		return model.ForwardSpec{}, err
 	}
 
-	return model.ForwardSpec{}, fmt.Errorf("forward format must be localPort:remoteHost:remotePort or localAddr:localPort:remoteHost:remotePort")
+	// The remaining left side is either "localPort" or "localAddr:localPort".
+	var localAddr string
+	localPort, err := strconv.Atoi(rest)
+	if err != nil {
+		localAddr, localPort, err = splitAddrPort(rest)
+		if err != nil {
+			return model.ForwardSpec{}, fmt.Errorf("invalid local endpoint: %w", err)
+		}
+	}
+	if err := util.ValidatePort(localPort); err != nil {
+		return model.ForwardSpec{}, fmt.Errorf("invalid local port: %w", err)
+	}
+	if err := util.ValidatePort(remotePort); err != nil {
+		return model.ForwardSpec{}, fmt.Errorf("invalid remote port: %w", err)
+	}
+
+	fwd := model.ForwardSpec{
+		LocalAddr:  util.NormalizeAddr(localAddr, "127.0.0.1"),
+		LocalPort:  localPort,
+		RemoteAddr: util.NormalizeAddr(remoteAddr, "localhost"),
+		RemotePort: remotePort,
+	}
+	if err := validateForwardSpec(fwd); err != nil {
+		return model.ForwardSpec{}, err
+	}
+	return fwd, nil
+}
+
+func parseAddrPortTail(s string) (addr string, port int, rest string, err error) {
+	idx := strings.LastIndex(s, ":")
+	if idx <= 0 || idx == len(s)-1 {
+		return "", 0, "", fmt.Errorf("forward format must include remote host and remote port")
+	}
+	port, err = strconv.Atoi(s[idx+1:])
+	if err != nil {
+		return "", 0, "", fmt.Errorf("invalid remote port: %w", err)
+	}
+	left := s[:idx]
+
+	if strings.HasSuffix(left, "]") {
+		// localPart:[ipv6]
+		start := strings.LastIndex(left, "[")
+		if start == -1 || start == 0 || left[start-1] != ':' {
+			return "", 0, "", fmt.Errorf("invalid bracketed IPv6 remote host")
+		}
+		addr = left[start+1 : len(left)-1]
+		rest = left[:start-1]
+		return addr, port, rest, nil
+	}
+
+	hostSep := strings.LastIndex(left, ":")
+	if hostSep <= 0 || hostSep == len(left)-1 {
+		return "", 0, "", fmt.Errorf("forward format must be localPort:remoteHost:remotePort or localAddr:localPort:remoteHost:remotePort")
+	}
+	addr = left[hostSep+1:]
+	rest = left[:hostSep]
+	return addr, port, rest, nil
+}
+
+func splitAddrPort(s string) (string, int, error) {
+	if strings.HasPrefix(s, "[") {
+		h, p, err := net.SplitHostPort(s)
+		if err != nil {
+			return "", 0, err
+		}
+		port, err := strconv.Atoi(p)
+		if err != nil {
+			return "", 0, err
+		}
+		return h, port, nil
+	}
+	if strings.Count(s, ":") > 1 {
+		return "", 0, fmt.Errorf("IPv6 local bind addresses must be bracketed, e.g. [::1]:8080")
+	}
+	idx := strings.LastIndex(s, ":")
+	if idx <= 0 || idx == len(s)-1 {
+		return "", 0, fmt.Errorf("expected host:port")
+	}
+	port, err := strconv.Atoi(s[idx+1:])
+	if err != nil {
+		return "", 0, err
+	}
+	return s[:idx], port, nil
+}
+
+func validateForwardSpec(fwd model.ForwardSpec) error {
+	local := util.NormalizeAddr(fwd.LocalAddr, "127.0.0.1")
+	remote := util.NormalizeAddr(fwd.RemoteAddr, "localhost")
+	if err := validateEndpointHost(local); err != nil {
+		return fmt.Errorf("invalid local address %q: %w", local, err)
+	}
+	if err := validateEndpointHost(remote); err != nil {
+		return fmt.Errorf("invalid remote address %q: %w", remote, err)
+	}
+	return nil
+}
+
+func validateEndpointHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Errorf("host cannot be empty")
+	}
+	if strings.ContainsAny(host, " \t\r\n") {
+		return fmt.Errorf("host cannot contain whitespace")
+	}
+	unwrapped := strings.Trim(host, "[]")
+	if ip := net.ParseIP(unwrapped); ip != nil {
+		return nil
+	}
+	if strings.EqualFold(unwrapped, "localhost") {
+		return nil
+	}
+	if strings.ContainsAny(unwrapped, "/\\") {
+		return fmt.Errorf("host cannot contain path separators")
+	}
+	return nil
+}
+
+func isPublicBindAddr(addr string) bool {
+	v := strings.Trim(strings.TrimSpace(addr), "[]")
+	if v == "" {
+		return false
+	}
+	if v == "*" {
+		return true
+	}
+	ip := net.ParseIP(v)
+	return ip != nil && ip.IsUnspecified()
+}
+
+func processCommand(pid int) (string, error) {
+	out, err := exec.Command("ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return "", err
+	}
+	cmd := strings.TrimSpace(string(out))
+	if cmd == "" {
+		return "", fmt.Errorf("empty command line")
+	}
+	return cmd, nil
+}
+
+func isManagedTunnelProcess(cmdline string, rt model.TunnelRuntime) bool {
+	cmdline = strings.TrimSpace(cmdline)
+	if !strings.Contains(cmdline, "ssh") || !strings.Contains(cmdline, "-N") || !strings.Contains(cmdline, "-L") {
+		return false
+	}
+	if !strings.Contains(cmdline, rt.HostAlias) {
+		return false
+	}
+	if !strings.Contains(cmdline, rt.Local) || !strings.Contains(cmdline, rt.Remote) {
+		return false
+	}
+	return true
 }
 
 // processAlive checks whether a process with the given PID is still running.

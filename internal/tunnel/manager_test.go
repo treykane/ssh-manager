@@ -22,11 +22,15 @@ package tunnel
 
 import (
 	"context"
+	"encoding/json"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 )
@@ -198,6 +202,20 @@ func TestParseForwardArg(t *testing.T) {
 	}
 }
 
+func TestParseForwardArgIPv6(t *testing.T) {
+	fwd, err := ParseForwardArg("[::1]:8080:[2001:db8::1]:5432")
+	if err != nil {
+		t.Fatalf("expected bracketed IPv6 parse to succeed: %v", err)
+	}
+	if fwd.LocalAddr != "::1" || fwd.RemoteAddr != "2001:db8::1" {
+		t.Fatalf("unexpected IPv6 parse result: %+v", fwd)
+	}
+
+	if _, err := ParseForwardArg("::1:8080:localhost:80"); err == nil {
+		t.Fatal("expected unbracketed IPv6 local address to fail")
+	}
+}
+
 // TestSnapshotAddsUptime verifies that the Snapshot() method correctly computes
 // and populates the UptimeSec field for active tunnels.
 //
@@ -241,5 +259,71 @@ func TestSnapshotAddsUptime(t *testing.T) {
 	sn := m.Snapshot()
 	if len(sn) == 0 || sn[0].UptimeSec < 1 {
 		t.Fatalf("expected uptime to be populated, got %+v", sn)
+	}
+}
+
+func TestManagerStart_RejectsPublicBindByDefault(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := NewManager(fakeStarter{})
+	h := model.HostEntry{Alias: "api"}
+	_, err := m.Start(h, model.ForwardSpec{LocalAddr: "0.0.0.0", LocalPort: 9300, RemoteAddr: "localhost", RemotePort: 80})
+	if err == nil {
+		t.Fatal("expected public bind to be rejected by default policy")
+	}
+}
+
+func TestManagerStart_AllowsPublicBindWithOverride(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := NewManager(fakeStarter{})
+	m.SetAllowPublicBind(true)
+	h := model.HostEntry{Alias: "api"}
+	rt, err := m.Start(h, model.ForwardSpec{LocalAddr: "0.0.0.0", LocalPort: 9301, RemoteAddr: "localhost", RemotePort: 80})
+	if err != nil {
+		t.Fatalf("expected override to allow bind: %v", err)
+	}
+	defer func() { _ = m.Stop(rt.ID) }()
+}
+
+func TestLoadRuntimeQuarantinesMismatchedProcess(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill() }()
+
+	path, err := appconfig.RuntimeFilePath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runtime := []model.TunnelRuntime{{
+		ID:        "prod|127.0.0.1:15432|localhost:5432",
+		HostAlias: "prod",
+		Local:     "127.0.0.1:15432",
+		Remote:    "localhost:5432",
+		State:     model.TunnelUp,
+		PID:       cmd.Process.Pid,
+	}}
+	b, err := json.Marshal(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m := NewManager(fakeStarter{})
+	if err := m.LoadRuntime(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := m.Get(runtime[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != model.TunnelQuarantined {
+		t.Fatalf("expected quarantined state, got %s", got.State)
 	}
 }

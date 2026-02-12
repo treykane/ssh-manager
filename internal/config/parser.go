@@ -28,6 +28,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -399,19 +400,43 @@ func parseEndpoint(s string, local bool) (string, int, bool) {
 		if err != nil {
 			return "", 0, false
 		}
+		if err := util.ValidatePort(p); err != nil {
+			return "", 0, false
+		}
 		if local {
 			return "127.0.0.1", p, true
 		}
 		return "localhost", p, true
 	}
 
-	// Split on the last colon to handle IPv4 addresses (e.g. "192.168.1.1:8080").
-	// Note: IPv6 addresses in brackets (e.g. "[::1]:8080") are not currently handled.
-	idx := strings.LastIndex(s, ":")
-	addr := s[:idx]
-	portStr := s[idx+1:]
-	p, err := strconv.Atoi(portStr)
-	if err != nil {
+	var (
+		addr string
+		p    int
+		err  error
+	)
+	if strings.HasPrefix(s, "[") {
+		var portStr string
+		addr, portStr, err = net.SplitHostPort(s)
+		if err != nil {
+			return "", 0, false
+		}
+		p, err = strconv.Atoi(portStr)
+		if err != nil {
+			return "", 0, false
+		}
+	} else {
+		if strings.Count(s, ":") > 1 {
+			// Require bracketed IPv6 to avoid ambiguous parsing.
+			return "", 0, false
+		}
+		idx := strings.LastIndex(s, ":")
+		addr = s[:idx]
+		p, err = strconv.Atoi(s[idx+1:])
+		if err != nil {
+			return "", 0, false
+		}
+	}
+	if err := util.ValidatePort(p); err != nil {
 		return "", 0, false
 	}
 

@@ -152,6 +152,10 @@ const (
 	// has not yet fully terminated. This prevents the watch goroutine from
 	// misinterpreting the exit as an unexpected failure.
 	TunnelStopping TunnelState = "stopping"
+
+	// TunnelQuarantined indicates a runtime entry was restored from disk but
+	// could not be confidently matched to a managed ssh process.
+	TunnelQuarantined TunnelState = "quarantined"
 )
 
 // TunnelRuntime tracks the runtime state of an active or historical SSH tunnel.

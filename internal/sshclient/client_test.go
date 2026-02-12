@@ -73,6 +73,25 @@ func TestBuildTunnelArgs(t *testing.T) {
 	}
 }
 
+func TestBuildTunnelArgs_HostKeyPolicy(t *testing.T) {
+	c := New()
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 8080, RemoteAddr: "localhost", RemotePort: 80}
+
+	c.SetHostKeyPolicy("accept-new")
+	got := c.BuildTunnelArgs("prod", fwd)
+	want := []string{"-N", "-o", "StrictHostKeyChecking=accept-new", "-L", "127.0.0.1:8080:localhost:80", "prod"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("accept-new args mismatch\nwant=%v\n got=%v", want, got)
+	}
+
+	c.SetHostKeyPolicy("insecure")
+	got = c.BuildTunnelArgs("prod", fwd)
+	want = []string{"-N", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-L", "127.0.0.1:8080:localhost:80", "prod"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("insecure args mismatch\nwant=%v\n got=%v", want, got)
+	}
+}
+
 // TestConnectAdHocCommand verifies that ConnectAdHocCommand produces the correct
 // SSH command-line arguments for ad-hoc connections with explicit parameters.
 func TestConnectAdHocCommand(t *testing.T) {
