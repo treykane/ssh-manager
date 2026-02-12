@@ -150,9 +150,6 @@ Stop **all** active tunnels for a host:
 ./ssh-manager tunnel status --json
 ```
 
-<<<<<<< HEAD
-#### JSON Schema
-=======
 Restart tunnel(s):
 
 ```bash
@@ -175,7 +172,6 @@ Run security audit:
 ```
 
 ## `tunnel status --json` schema
->>>>>>> 220769d (Security focused enhancements)
 
 The `--json` output contains these stable fields per tunnel:
 
@@ -191,9 +187,6 @@ The `--json` output contains these stable fields per tunnel:
 | `latency_ms`     | Last measured latency              |
 | `last_error`     | Most recent error message, if any  |
 
-<<<<<<< HEAD
----
-=======
 In dashboard mode:
 - `j` / `k` or arrow keys: move selection
 - `Enter`: open interactive SSH session to selected host
@@ -204,7 +197,6 @@ In dashboard mode:
 - `r`: reload SSH config and tunnel snapshot
 - `?`: toggle help block
 - `q` / `Ctrl+C`: quit (stops managed tunnels)
->>>>>>> 220769d (Security focused enhancements)
 
 ## Configuration
 
