@@ -485,6 +485,10 @@ func TestManagerAutoRestartUnexpectedExit(t *testing.T) {
 	for time.Now().Before(deadline) {
 		got, gerr := m.Get(rt.ID)
 		if gerr == nil && got.State == model.TunnelUp && got.PID > 0 && atomic.LoadInt32(&starter.calls) >= 2 {
+			stats := m.RestartStats()[rt.ID]
+			if stats.Attempts < 1 || stats.Successes < 1 {
+				t.Fatalf("expected restart stats attempts/successes, got %+v", stats)
+			}
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -517,6 +521,10 @@ func TestManagerAutoRestartQuarantinesAtMaxAttempts(t *testing.T) {
 	}
 	if got.State != model.TunnelQuarantined {
 		t.Fatalf("expected quarantined state after max attempts, got %s", got.State)
+	}
+	stats := m.RestartStats()[rt.ID]
+	if stats.Failures < 1 || stats.Attempts < 1 {
+		t.Fatalf("expected restart failures/attempts stats, got %+v", stats)
 	}
 	if atomic.LoadInt32(&starter.calls) != 3 {
 		t.Fatalf("expected initial + 2 restart attempts, got %d", starter.calls)

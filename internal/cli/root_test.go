@@ -292,6 +292,38 @@ func TestTunnelReconcileJSONOutput(t *testing.T) {
 	}
 }
 
+func TestTunnelMetricsJSONOutput(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	writeRuntimeForCLI(t, []map[string]any{
+		{
+			"id":             "api|127.0.0.1:9501|localhost:80",
+			"host_alias":     "api",
+			"local":          "127.0.0.1:9501",
+			"remote":         "localhost:80",
+			"state":          "down",
+			"pid":            0,
+			"uptime_seconds": 0,
+			"latency_ms":     0,
+		},
+	})
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"tunnel", "metrics", "--json"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("metrics json: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid metrics json: %v", err)
+	}
+	if _, ok := payload["global"]; !ok {
+		t.Fatalf("expected global in metrics output: %s", out)
+	}
+	if _, ok := payload["hosts"]; !ok {
+		t.Fatalf("expected hosts in metrics output: %s", out)
+	}
+}
+
 func captureStdout(fn func() error) (string, error) {
 	orig := os.Stdout
 	r, w, err := os.Pipe()

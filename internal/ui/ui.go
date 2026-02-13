@@ -35,6 +35,7 @@ package ui
 import (
 	"fmt"
 	"log/slog"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -706,6 +707,7 @@ func (m dashboardModel) View() string {
 
 	// Render the tunnel table and status bar as full-width panels.
 	tunnels := m.renderPanel("Active Tunnels", tbl.String(), m.effectiveWidth(), lipgloss.Color("63"))
+	metrics := m.renderPanel("Metrics", m.metricsLine(), m.effectiveWidth(), lipgloss.Color("45"))
 	status := m.renderPanel("Status", m.status, m.effectiveWidth(), lipgloss.Color("205"))
 	eventsPanel := ""
 	if m.showEvents {
@@ -727,6 +729,7 @@ func (m dashboardModel) View() string {
 		quickHelp,
 		main,
 		tunnels,
+		metrics,
 		eventsPanel,
 		help,
 		warn,
@@ -933,6 +936,47 @@ func (m dashboardModel) eventsView() string {
 		))
 	}
 	return b.String()
+}
+
+func (m dashboardModel) metricsLine() string {
+	up := 0
+	errs := 0
+	quarantined := 0
+	var lat []int64
+	for _, rt := range m.tunnels {
+		switch rt.State {
+		case model.TunnelUp:
+			up++
+			lat = append(lat, rt.LatencyMS)
+		case model.TunnelError:
+			errs++
+		case model.TunnelQuarantined:
+			quarantined++
+		}
+	}
+	avg, p95 := latencyAggUI(lat)
+	return fmt.Sprintf("up=%d error=%d quarantined=%d avg-lat=%.1fms p95=%dms", up, errs, quarantined, avg, p95)
+}
+
+func latencyAggUI(vals []int64) (float64, int64) {
+	if len(vals) == 0 {
+		return 0, 0
+	}
+	sorted := append([]int64(nil), vals...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	var sum int64
+	for _, v := range sorted {
+		sum += v
+	}
+	avg := float64(sum) / float64(len(sorted))
+	idx := int(float64(len(sorted))*0.95) - 1
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(sorted) {
+		idx = len(sorted) - 1
+	}
+	return avg, sorted[idx]
 }
 
 func (m dashboardModel) bundleView() string {

@@ -109,6 +109,7 @@ type Manager struct {
 	restartBackoff     time.Duration
 	restartStable      time.Duration
 	restartAttempts    map[string]int
+	restartStats       map[string]RestartStats
 
 	// event journal for lifecycle observability.
 	eventStore *events.Store
@@ -140,6 +141,15 @@ type ReconcileAction struct {
 	Recovered bool              `json:"recovered"`
 }
 
+// RestartStats tracks auto-restart reliability for one tunnel ID.
+type RestartStats struct {
+	Attempts    int       `json:"attempts"`
+	Successes   int       `json:"successes"`
+	Failures    int       `json:"failures"`
+	LastError   string    `json:"last_error,omitempty"`
+	LastErrorAt time.Time `json:"last_error_at,omitempty"`
+}
+
 // TunnelStarter abstracts SSH tunnel process creation for testing.
 //
 // In production, *sshclient.Client implements this interface. In tests, a fake
@@ -157,7 +167,7 @@ type TunnelStarter interface {
 // The returned Manager has empty state; call LoadRuntime() after creation to
 // restore any previously persisted tunnel state from disk.
 func NewManager(client TunnelStarter) *Manager {
-	return &Manager{
+	m := &Manager{
 		client:             client,
 		runtime:            make(map[string]model.TunnelRuntime),
 		cancel:             make(map[string]context.CancelFunc),
@@ -168,8 +178,11 @@ func NewManager(client TunnelStarter) *Manager {
 		restartBackoff:     2 * time.Second,
 		restartStable:      30 * time.Second,
 		restartAttempts:    make(map[string]int),
+		restartStats:       make(map[string]RestartStats),
 		eventStore:         events.NewStore(),
 	}
+	_ = m.loadRestartStats()
+	return m
 }
 
 func (m *Manager) Events(q events.Query) ([]events.Event, error) {
@@ -194,6 +207,47 @@ func (m *Manager) recordEvent(eventType string, rt model.TunnelRuntime, message 
 	}); err != nil {
 		slog.Warn("failed to append tunnel event", "event", eventType, "error", err)
 	}
+}
+
+func (m *Manager) RestartStats() map[string]RestartStats {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make(map[string]RestartStats, len(m.restartStats))
+	for id, st := range m.restartStats {
+		out[id] = st
+	}
+	return out
+}
+
+func (m *Manager) markRestartAttempt(id string) {
+	m.mu.Lock()
+	st := m.restartStats[id]
+	st.Attempts++
+	m.restartStats[id] = st
+	m.mu.Unlock()
+	_ = m.persistRestartStats()
+}
+
+func (m *Manager) markRestartSuccess(id string) {
+	m.mu.Lock()
+	st := m.restartStats[id]
+	st.Successes++
+	st.LastError = ""
+	st.LastErrorAt = time.Time{}
+	m.restartStats[id] = st
+	m.mu.Unlock()
+	_ = m.persistRestartStats()
+}
+
+func (m *Manager) markRestartFailure(id, reason string) {
+	m.mu.Lock()
+	st := m.restartStats[id]
+	st.Failures++
+	st.LastError = reason
+	st.LastErrorAt = time.Now().UTC()
+	m.restartStats[id] = st
+	m.mu.Unlock()
+	_ = m.persistRestartStats()
 }
 
 func (m *Manager) SetBindPolicy(policy string) {
@@ -467,6 +521,7 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 					m.mu.Unlock()
 					m.recordEvent("unexpected_exit", rt, rt.LastError)
 					m.recordEvent("restart_attempt", rt, fmt.Sprintf("auto-restart attempt %d/%d scheduled", attempt, m.restartMaxAttempts))
+					m.markRestartAttempt(id)
 
 					if persistErr := m.persist(); persistErr != nil {
 						slog.Warn("failed to persist tunnel state after restart scheduling", "error", persistErr)
@@ -482,6 +537,7 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 				m.mu.Unlock()
 				m.recordEvent("unexpected_exit", rt, "unexpected tunnel exit")
 				m.recordEvent("quarantine", rt, rt.LastError)
+				m.markRestartFailure(id, rt.LastError)
 				if persistErr := m.persist(); persistErr != nil {
 					slog.Warn("failed to persist tunnel state after quarantine", "error", persistErr)
 				}
@@ -661,6 +717,7 @@ func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt
 		m.runtime[id] = rt
 		m.mu.Unlock()
 		m.recordEvent("restart_failure", rt, rt.LastError)
+		m.markRestartFailure(id, rt.LastError)
 		_ = m.persist()
 		return
 	}
@@ -676,6 +733,7 @@ func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt
 			m.runtime[id] = rt
 			m.mu.Unlock()
 			m.recordEvent("restart_failure", rt, rt.LastError)
+			m.markRestartFailure(id, rt.LastError)
 			_ = m.persist()
 			return
 		}
@@ -691,10 +749,12 @@ func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt
 		m.runtime[id] = rt
 		m.mu.Unlock()
 		m.recordEvent("restart_failure", rt, rt.LastError)
+		m.markRestartFailure(id, rt.LastError)
 		_ = m.persist()
 		return
 	}
 	m.recordEvent("restart_success", next, fmt.Sprintf("auto-restart attempt %d/%d succeeded", attempt, m.restartMaxAttempts))
+	m.markRestartSuccess(id)
 }
 
 func (m *Manager) scheduleRestartReset(id string, startedAt time.Time) {
@@ -1050,6 +1110,59 @@ func (m *Manager) persist() error {
 	// This is slightly more secure than 0644 since the file contains PIDs
 	// and host alias information.
 	return os.WriteFile(path, b, 0o600)
+}
+
+func restartStatsFilePath() (string, error) {
+	dir, err := appconfig.ConfigDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "restart_metrics.json"), nil
+}
+
+func (m *Manager) persistRestartStats() error {
+	path, err := restartStatsFilePath()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	payload := make(map[string]RestartStats, len(m.restartStats))
+	for id, st := range m.restartStats {
+		payload[id] = st
+	}
+	m.mu.Unlock()
+	b, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
+func (m *Manager) loadRestartStats() error {
+	path, err := restartStatsFilePath()
+	if err != nil {
+		return err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var payload map[string]RestartStats
+	if err := json.Unmarshal(b, &payload); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	for id, st := range payload {
+		m.restartStats[id] = st
+	}
+	m.mu.Unlock()
+	return nil
 }
 
 // ParseForwardArg parses a forward specification string provided as a CLI argument.

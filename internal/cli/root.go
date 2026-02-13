@@ -24,6 +24,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"sort"
 	"strconv"
@@ -361,6 +362,8 @@ func newTunnelCmd() *cobra.Command {
 	var reconcileHost string
 	var reconcileJSON bool
 	var reconcileRecover bool
+	var metricsHost string
+	var metricsJSON bool
 
 	status := &cobra.Command{
 		Use:   "status",
@@ -551,7 +554,56 @@ func newTunnelCmd() *cobra.Command {
 	reconcile.Flags().BoolVar(&reconcileJSON, "json", false, "output JSON")
 	reconcile.Flags().BoolVar(&reconcileRecover, "recover", false, "attempt recover for newly quarantined entries")
 
-	root.AddCommand(up, down, status, restart, recover, reconcile, check, eventsCmd)
+	metricsCmd := &cobra.Command{
+		Use:   "metrics",
+		Short: "Show tunnel reliability metrics and restart diagnostics",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			report := buildMetricsReport(mgr.Snapshot(), mgr.RestartStats(), strings.TrimSpace(metricsHost))
+			if metricsJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(report)
+			}
+			fmt.Printf("global: total=%d up=%d down=%d error=%d quarantined=%d starting=%d stopping=%d restart_rate=%.2f%% latency_avg=%.1fms latency_p95=%dms\n",
+				report.Global.Total,
+				report.Global.StateCounts[string(model.TunnelUp)],
+				report.Global.StateCounts[string(model.TunnelDown)],
+				report.Global.StateCounts[string(model.TunnelError)],
+				report.Global.StateCounts[string(model.TunnelQuarantined)],
+				report.Global.StateCounts[string(model.TunnelStarting)],
+				report.Global.StateCounts[string(model.TunnelStopping)],
+				report.Global.RestartSuccessRate,
+				report.Global.LatencyAvgMS,
+				report.Global.LatencyP95MS,
+			)
+			if len(report.Hosts) == 0 {
+				fmt.Println("(no host metrics)")
+				return nil
+			}
+			fmt.Printf("%-16s %-6s %-8s %-8s %-8s %-8s %-8s %-8s %-12s %-10s %-10s\n",
+				"HOST", "TOTAL", "UP", "DOWN", "ERROR", "QUAR", "START", "STOP", "RESTART(%)", "AVG(ms)", "P95(ms)")
+			for _, h := range report.Hosts {
+				fmt.Printf("%-16s %-6d %-8d %-8d %-8d %-8d %-8d %-8d %-12.2f %-10.1f %-10d\n",
+					h.HostAlias,
+					h.Total,
+					h.StateCounts[string(model.TunnelUp)],
+					h.StateCounts[string(model.TunnelDown)],
+					h.StateCounts[string(model.TunnelError)],
+					h.StateCounts[string(model.TunnelQuarantined)],
+					h.StateCounts[string(model.TunnelStarting)],
+					h.StateCounts[string(model.TunnelStopping)],
+					h.RestartSuccessRate,
+					h.LatencyAvgMS,
+					h.LatencyP95MS,
+				)
+			}
+			return nil
+		},
+	}
+	metricsCmd.Flags().StringVar(&metricsHost, "host", "", "filter metrics to one host alias")
+	metricsCmd.Flags().BoolVar(&metricsJSON, "json", false, "output JSON")
+
+	root.AddCommand(up, down, status, restart, recover, reconcile, check, eventsCmd, metricsCmd)
 	return root
 }
 
@@ -625,6 +677,148 @@ func printTunnelSummary(sn []model.TunnelRuntime) {
 		}
 	}
 	fmt.Println()
+}
+
+type metricsBucket struct {
+	HostAlias          string         `json:"host_alias,omitempty"`
+	Total              int            `json:"total"`
+	StateCounts        map[string]int `json:"state_counts"`
+	RestartAttempts    int            `json:"restart_attempts"`
+	RestartSuccesses   int            `json:"restart_successes"`
+	RestartFailures    int            `json:"restart_failures"`
+	RestartSuccessRate float64        `json:"restart_success_rate"`
+	LatencyAvgMS       float64        `json:"latency_avg_ms"`
+	LatencyP95MS       int64          `json:"latency_p95_ms"`
+}
+
+type metricsReport struct {
+	Global metricsBucket   `json:"global"`
+	Hosts  []metricsBucket `json:"hosts"`
+}
+
+func buildMetricsReport(sn []model.TunnelRuntime, restart map[string]tunnel.RestartStats, hostFilter string) metricsReport {
+	hostFilter = strings.TrimSpace(hostFilter)
+	filtered := make([]model.TunnelRuntime, 0, len(sn))
+	for _, rt := range sn {
+		if hostFilter != "" && rt.HostAlias != hostFilter {
+			continue
+		}
+		filtered = append(filtered, rt)
+	}
+
+	hostBuckets := map[string]*metricsBucket{}
+	for _, rt := range filtered {
+		hb := hostBuckets[rt.HostAlias]
+		if hb == nil {
+			hb = &metricsBucket{
+				HostAlias:   rt.HostAlias,
+				StateCounts: zeroStateCounts(),
+			}
+			hostBuckets[rt.HostAlias] = hb
+		}
+		hb.Total++
+		hb.StateCounts[string(rt.State)]++
+		if rt.State == model.TunnelUp {
+			hb.LatencyAvgMS += float64(rt.LatencyMS)
+		}
+	}
+
+	for id, st := range restart {
+		host := strings.SplitN(id, "|", 2)[0]
+		if hostFilter != "" && host != hostFilter {
+			continue
+		}
+		hb := hostBuckets[host]
+		if hb == nil {
+			hb = &metricsBucket{
+				HostAlias:   host,
+				StateCounts: zeroStateCounts(),
+			}
+			hostBuckets[host] = hb
+		}
+		hb.RestartAttempts += st.Attempts
+		hb.RestartSuccesses += st.Successes
+		hb.RestartFailures += st.Failures
+	}
+
+	hosts := make([]metricsBucket, 0, len(hostBuckets))
+	for _, hb := range hostBuckets {
+		lat := latenciesForHost(filtered, hb.HostAlias)
+		hb.LatencyAvgMS, hb.LatencyP95MS = latencyAgg(lat)
+		hb.RestartSuccessRate = successRate(hb.RestartSuccesses, hb.RestartAttempts)
+		hosts = append(hosts, *hb)
+	}
+	sort.Slice(hosts, func(i, j int) bool { return hosts[i].HostAlias < hosts[j].HostAlias })
+
+	global := metricsBucket{StateCounts: zeroStateCounts()}
+	for _, h := range hosts {
+		global.Total += h.Total
+		for k, v := range h.StateCounts {
+			global.StateCounts[k] += v
+		}
+		global.RestartAttempts += h.RestartAttempts
+		global.RestartSuccesses += h.RestartSuccesses
+		global.RestartFailures += h.RestartFailures
+	}
+	allLat := make([]int64, 0, len(filtered))
+	for _, rt := range filtered {
+		if rt.State == model.TunnelUp {
+			allLat = append(allLat, rt.LatencyMS)
+		}
+	}
+	global.LatencyAvgMS, global.LatencyP95MS = latencyAgg(allLat)
+	global.RestartSuccessRate = successRate(global.RestartSuccesses, global.RestartAttempts)
+
+	return metricsReport{Global: global, Hosts: hosts}
+}
+
+func zeroStateCounts() map[string]int {
+	return map[string]int{
+		string(model.TunnelUp):          0,
+		string(model.TunnelDown):        0,
+		string(model.TunnelError):       0,
+		string(model.TunnelQuarantined): 0,
+		string(model.TunnelStarting):    0,
+		string(model.TunnelStopping):    0,
+	}
+}
+
+func successRate(successes, attempts int) float64 {
+	if attempts == 0 {
+		return 0
+	}
+	return (float64(successes) / float64(attempts)) * 100
+}
+
+func latenciesForHost(sn []model.TunnelRuntime, host string) []int64 {
+	var out []int64
+	for _, rt := range sn {
+		if rt.HostAlias == host && rt.State == model.TunnelUp {
+			out = append(out, rt.LatencyMS)
+		}
+	}
+	return out
+}
+
+func latencyAgg(vals []int64) (float64, int64) {
+	if len(vals) == 0 {
+		return 0, 0
+	}
+	sorted := append([]int64(nil), vals...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	var sum int64
+	for _, v := range sorted {
+		sum += v
+	}
+	avg := float64(sum) / float64(len(sorted))
+	p95Idx := int(math.Ceil(float64(len(sorted))*0.95)) - 1
+	if p95Idx < 0 {
+		p95Idx = 0
+	}
+	if p95Idx >= len(sorted) {
+		p95Idx = len(sorted) - 1
+	}
+	return avg, sorted[p95Idx]
 }
 
 func forwardFromRuntime(rt model.TunnelRuntime) (model.ForwardSpec, error) {
