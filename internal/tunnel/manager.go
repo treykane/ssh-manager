@@ -286,9 +286,9 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 		return
 	}
 
-	// If the tunnel is in "stopping" state, it means Stop() was called and
-	// already handled the state transition. Don't overwrite it.
-	if rt.State != model.TunnelStopping {
+	// If the tunnel is already in an intentional terminal/transition state
+	// from Stop(), don't overwrite it with process-exit derived values.
+	if rt.State != model.TunnelStopping && rt.State != model.TunnelDown {
 		if err != nil {
 			rt.State = model.TunnelError
 			rt.LastError = security.UserMessage(err, m.redactErrors)
