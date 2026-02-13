@@ -34,6 +34,7 @@ import (
 	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/config"
+	"github.com/treykane/ssh-manager/internal/doctor"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
@@ -68,6 +69,7 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newListCmd())
 	root.AddCommand(newTunnelCmd())
 	root.AddCommand(newBundleCmd())
+	root.AddCommand(newDoctorCmd())
 	root.AddCommand(newSecurityCmd())
 	return root
 }
@@ -678,5 +680,40 @@ func newSecurityCmd() *cobra.Command {
 	}
 	audit.Flags().BoolVar(&jsonOut, "json", false, "output JSON")
 	cmd.AddCommand(audit)
+	return cmd
+}
+
+func newDoctorCmd() *cobra.Command {
+	var jsonOut bool
+	cmd := &cobra.Command{
+		Use:   "doctor",
+		Short: "Run operational diagnostics",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			report, err := doctor.Run()
+			if err != nil {
+				return err
+			}
+			if jsonOut {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(report)
+			}
+			if len(report.Issues) == 0 {
+				fmt.Println("No doctor findings.")
+				return nil
+			}
+			fmt.Printf("%-8s %-24s %-26s %s\n", "SEV", "CHECK", "TARGET", "MESSAGE")
+			for _, issue := range report.Issues {
+				fmt.Printf("%-8s %-24s %-26s %s\n",
+					strings.ToUpper(string(issue.Severity)),
+					issue.Check,
+					issue.Target,
+					issue.Message,
+				)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "output JSON")
 	return cmd
 }

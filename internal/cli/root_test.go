@@ -116,6 +116,23 @@ func TestBundleRunReturnsSummaryOnPartialFailures(t *testing.T) {
 	}
 }
 
+func TestDoctorJSONOutput(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"doctor", "--json"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("doctor json: %v", err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid doctor json: %v", err)
+	}
+	if _, ok := payload["issues"]; !ok {
+		t.Fatalf("expected issues key in doctor output: %s", out)
+	}
+}
+
 func captureStdout(fn func() error) (string, error) {
 	orig := os.Stdout
 	r, w, err := os.Pipe()
