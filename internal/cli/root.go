@@ -35,6 +35,7 @@ import (
 	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/config"
 	"github.com/treykane/ssh-manager/internal/doctor"
+	"github.com/treykane/ssh-manager/internal/history"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
@@ -88,7 +89,8 @@ func NewRootCommand() *cobra.Command {
 // stderr after the host table so they don't interfere with stdout parsing by
 // scripts.
 func newListCmd() *cobra.Command {
-	return &cobra.Command{
+	var recentFirst bool
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List parsed hosts from ~/.ssh/config",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -97,16 +99,18 @@ func newListCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			hosts := res.Hosts
+			if recentFirst {
+				last, _ := history.LastUsed()
+				hosts = history.SortHostsRecent(hosts, last)
+			}
 
 			// Print a formatted table header and rows.
-			// Hosts are already sorted alphabetically by the parser.
 			fmt.Printf("%-24s %-24s %-8s %-16s %s\n", "ALIAS", "HOSTNAME", "PORT", "USER", "FORWARDS")
-			for _, h := range res.Hosts {
+			for _, h := range hosts {
 				fmt.Printf("%-24s %-24s %-8d %-16s %d\n", h.Alias, h.DisplayTarget(), h.Port, util.EmptyDash(h.User), len(h.Forwards))
 			}
 
-			// Surface any warnings to stderr so users can diagnose config issues.
-			// These are non-fatal: the parse still succeeded for the hosts shown above.
 			if len(res.Warnings) > 0 {
 				fmt.Fprintln(os.Stderr, "warnings:")
 				for _, w := range res.Warnings {
@@ -116,6 +120,8 @@ func newListCmd() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&recentFirst, "recent", false, "sort hosts by recent successful use")
+	return cmd
 }
 
 // newTunnelCmd creates the "tunnel" parent command and its subcommands (up, down, status).
@@ -206,6 +212,7 @@ func newTunnelCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("%s", security.UserMessage(err, cfg.Security.RedactErrors))
 				}
+				_ = history.Touch(host.Alias)
 				fmt.Printf("started %s pid=%d %s -> %s\n", rt.ID, rt.PID, rt.Local, rt.Remote)
 			}
 			return nil
@@ -622,6 +629,7 @@ func newBundleCmd() *cobra.Command {
 							security.UserMessage(err, cfg.Security.RedactErrors))
 						continue
 					}
+					_ = history.Touch(host.Alias)
 					started++
 					fmt.Printf("started %s pid=%d\n", rt.ID, rt.PID)
 				}

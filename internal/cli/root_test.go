@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/treykane/ssh-manager/internal/bundle"
+	"github.com/treykane/ssh-manager/internal/history"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 )
 
@@ -130,6 +131,38 @@ func TestDoctorJSONOutput(t *testing.T) {
 	}
 	if _, ok := payload["issues"]; !ok {
 		t.Fatalf("expected issues key in doctor output: %s", out)
+	}
+}
+
+func TestListRecentOrdering(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	home := os.Getenv("HOME")
+	cfg := strings.Join([]string{
+		"Host api",
+		"  HostName 127.0.0.1",
+		"Host db",
+		"  HostName 127.0.0.1",
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(home, ".ssh", "config"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := history.Touch("db"); err != nil {
+		t.Fatal(err)
+	}
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"list", "--recent"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("list recent: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("unexpected output: %s", out)
+	}
+	if !strings.Contains(lines[1], "db") {
+		t.Fatalf("expected db first after header, got: %s", lines[1])
 	}
 }
 

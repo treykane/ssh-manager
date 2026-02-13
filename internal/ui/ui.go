@@ -44,6 +44,7 @@ import (
 	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/config"
+	"github.com/treykane/ssh-manager/internal/history"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
@@ -139,6 +140,8 @@ type dashboardModel struct {
 	bundleMode bool
 	bundles    []bundle.Definition
 	bundleSel  int
+
+	recentFirst bool
 }
 
 // initialModel creates the initial dashboardModel with loaded configuration,
@@ -222,6 +225,10 @@ func (m *dashboardModel) applyFilter() {
 				m.filtered = append(m.filtered, h)
 			}
 		}
+	}
+	if m.recentFirst {
+		last, _ := history.LastUsed()
+		m.filtered = history.SortHostsRecent(m.filtered, last)
 	}
 
 	// Clamp the selection index to the valid range for the new filtered list.
@@ -384,6 +391,15 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Toggle the help panel visibility.
 			m.showHelp = !m.showHelp
 
+		case "h":
+			m.recentFirst = !m.recentFirst
+			m.applyFilter()
+			if m.recentFirst {
+				m.status = "Recent-first sorting enabled"
+			} else {
+				m.status = "Recent-first sorting disabled"
+			}
+
 		case "r":
 			// Reload the SSH config from disk and refresh tunnel status.
 			// This picks up any changes the user made to ~/.ssh/config
@@ -407,6 +423,7 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if err != nil {
 					return statusMsg("ssh exited: " + security.UserMessage(err, m.cfg.Security.RedactErrors))
 				}
+				_ = history.Touch(h.Alias)
 				return statusMsg("ssh session closed")
 			})
 
@@ -631,7 +648,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | b bundles | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | b bundles | h recent-sort | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -805,6 +822,7 @@ func (m dashboardModel) renderMainPanels(hostsPanel, detailsPanel string) string
 func (m dashboardModel) helpBlock() string {
 	return strings.Join([]string{
 		"  Navigation: j/k or arrow keys move selection.",
+		"  Sorting: press h to toggle recent-first host ordering.",
 		"  Filtering: press /, type alias/host text, then Enter.",
 		"  Connect: press Enter on selected host.",
 		"  New: press n to configure a new SSH connection.",
@@ -852,6 +870,7 @@ func (m *dashboardModel) runBundle(def bundle.Definition) string {
 			if _, err := m.mgr.Start(host, fwd); err != nil {
 				failed++
 			} else {
+				_ = history.Touch(host.Alias)
 				started++
 			}
 		}
@@ -904,6 +923,7 @@ func (m *dashboardModel) toggleForward(host model.HostEntry, idx int) string {
 	if serr != nil {
 		return "Tunnel start failed: " + security.UserMessage(serr, m.cfg.Security.RedactErrors)
 	}
+	_ = history.Touch(host.Alias)
 	return fmt.Sprintf("Tunnel started: %s (pid=%d)", newRT.ID, newRT.PID)
 }
 
