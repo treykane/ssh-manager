@@ -259,6 +259,39 @@ func TestTunnelStatusWatchJSONRejected(t *testing.T) {
 	}
 }
 
+func TestTunnelReconcileJSONOutput(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	writeRuntimeForCLI(t, []map[string]any{
+		{
+			"id":             "api|",
+			"host_alias":     "api",
+			"local":          "",
+			"remote":         "",
+			"state":          "down",
+			"pid":            0,
+			"uptime_seconds": 0,
+			"latency_ms":     0,
+		},
+	})
+
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"tunnel", "reconcile", "--host", "api", "--json"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("reconcile json: %v", err)
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid reconcile json: %v", err)
+	}
+	if len(payload) != 1 {
+		t.Fatalf("expected 1 reconcile action, got %d", len(payload))
+	}
+	if payload[0]["to_state"] != "quarantined" {
+		t.Fatalf("unexpected reconcile action: %+v", payload[0])
+	}
+}
+
 func captureStdout(fn func() error) (string, error) {
 	orig := os.Stdout
 	r, w, err := os.Pipe()

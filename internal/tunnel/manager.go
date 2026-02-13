@@ -42,6 +42,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,6 +128,16 @@ type PreflightReport struct {
 	Remote    string             `json:"remote"`
 	OK        bool               `json:"ok"`
 	Findings  []PreflightFinding `json:"findings"`
+}
+
+// ReconcileAction describes one runtime correction.
+type ReconcileAction struct {
+	ID        string            `json:"id"`
+	HostAlias string            `json:"host_alias"`
+	FromState model.TunnelState `json:"from_state"`
+	ToState   model.TunnelState `json:"to_state"`
+	Reason    string            `json:"reason"`
+	Recovered bool              `json:"recovered"`
 }
 
 // TunnelStarter abstracts SSH tunnel process creation for testing.
@@ -556,6 +567,86 @@ func (m *Manager) RecoverByHost(hostAlias string) ([]model.TunnelRuntime, error)
 		out = append(out, rt)
 	}
 	return out, nil
+}
+
+// Reconcile validates runtime entries and quarantines suspicious state.
+// If recoverQuarantined is true, newly quarantined entries are immediately
+// recovered with the normal Recover flow.
+func (m *Manager) Reconcile(hostAlias string, recoverQuarantined bool) ([]ReconcileAction, error) {
+	m.mu.Lock()
+	ids := make([]string, 0, len(m.runtime))
+	for id := range m.runtime {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+
+	actions := make([]ReconcileAction, 0)
+	for _, id := range ids {
+		rt := m.runtime[id]
+		if strings.TrimSpace(hostAlias) != "" && rt.HostAlias != strings.TrimSpace(hostAlias) {
+			continue
+		}
+
+		reason := ""
+		if runtimeMetadataInvalid(rt) {
+			reason = "invalid runtime metadata"
+		} else if rt.State == model.TunnelUp && (rt.PID <= 0 || !processAlive(rt.PID)) {
+			reason = "runtime shows up with dead or missing PID"
+		}
+		if reason == "" {
+			continue
+		}
+
+		from := rt.State
+		rt.State = model.TunnelQuarantined
+		rt.PID = 0
+		rt.LastError = reason
+		m.runtime[id] = rt
+		actions = append(actions, ReconcileAction{
+			ID:        rt.ID,
+			HostAlias: rt.HostAlias,
+			FromState: from,
+			ToState:   rt.State,
+			Reason:    reason,
+		})
+	}
+	m.mu.Unlock()
+
+	if len(actions) > 0 {
+		if err := m.persist(); err != nil {
+			slog.Warn("failed to persist tunnel state after reconcile", "error", err)
+		}
+		for _, a := range actions {
+			m.recordEvent("quarantine", model.TunnelRuntime{
+				ID:        a.ID,
+				HostAlias: a.HostAlias,
+				State:     a.ToState,
+			}, a.Reason)
+		}
+	}
+
+	if recoverQuarantined {
+		for i := range actions {
+			next, err := m.Recover(actions[i].ID)
+			if err != nil {
+				actions[i].Reason = actions[i].Reason + "; recover failed: " + err.Error()
+				continue
+			}
+			actions[i].Recovered = true
+			actions[i].Reason = actions[i].Reason + "; recovered pid=" + strconv.Itoa(next.PID)
+		}
+	}
+	return actions, nil
+}
+
+func runtimeMetadataInvalid(rt model.TunnelRuntime) bool {
+	if strings.TrimSpace(rt.ID) == "" || strings.TrimSpace(rt.HostAlias) == "" {
+		return true
+	}
+	if strings.TrimSpace(rt.Local) == "" || strings.TrimSpace(rt.Remote) == "" {
+		return true
+	}
+	return false
 }
 
 func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt int) {

@@ -553,6 +553,23 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			_ = m.mgr.Stop(id)
 			m.status = m.toggleForward(h, 0)
 			m.tunnels = m.mgr.Snapshot()
+
+		case "x":
+			host := ""
+			if len(m.filtered) > 0 {
+				host = m.filtered[m.sel].Alias
+			}
+			actions, err := m.mgr.Reconcile(host, false)
+			if err != nil {
+				m.status = "Reconcile failed: " + security.UserMessage(err, m.cfg.Security.RedactErrors)
+				break
+			}
+			m.tunnels = m.mgr.Snapshot()
+			if len(actions) == 0 {
+				m.status = "Reconcile: no actions needed"
+			} else {
+				m.status = fmt.Sprintf("Reconcile: applied %d action(s)", len(actions))
+			}
 		}
 
 	case statusMsg:
@@ -671,7 +688,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | b bundles | h recent-sort | s tunnel-filter | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | e events | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | b bundles | h recent-sort | s tunnel-filter | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | x reconcile | e events | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -885,6 +902,7 @@ func (m dashboardModel) helpBlock() string {
 		"  Preflight: press c to validate selected host forwards before start.",
 		"  Tunnel: t toggles first forward; T processes all forwards; R restarts first forward.",
 		"  Events: press e to toggle recent tunnel lifecycle events.",
+		"  Reconcile: press x to quarantine suspicious runtime state for selected host.",
 		"  Recovery: press C to recover quarantined tunnels for selected host.",
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",

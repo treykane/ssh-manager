@@ -358,6 +358,9 @@ func newTunnelCmd() *cobra.Command {
 	var eventsSince string
 	var eventsLimit int
 	var eventsJSON bool
+	var reconcileHost string
+	var reconcileJSON bool
+	var reconcileRecover bool
 
 	status := &cobra.Command{
 		Use:   "status",
@@ -520,7 +523,35 @@ func newTunnelCmd() *cobra.Command {
 	eventsCmd.Flags().IntVar(&eventsLimit, "limit", 100, "maximum number of events to return")
 	eventsCmd.Flags().BoolVar(&eventsJSON, "json", false, "output JSON")
 
-	root.AddCommand(up, down, status, restart, recover, check, eventsCmd)
+	reconcile := &cobra.Command{
+		Use:   "reconcile",
+		Short: "Reconcile tunnel runtime state and quarantine suspicious entries",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			actions, err := mgr.Reconcile(strings.TrimSpace(reconcileHost), reconcileRecover)
+			if err != nil {
+				return err
+			}
+			if reconcileJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(actions)
+			}
+			if len(actions) == 0 {
+				fmt.Println("No runtime reconcile actions.")
+				return nil
+			}
+			fmt.Printf("%-42s %-16s %-14s %-14s %-10s %s\n", "ID", "HOST", "FROM", "TO", "RECOVERED", "REASON")
+			for _, a := range actions {
+				fmt.Printf("%-42s %-16s %-14s %-14s %-10t %s\n", a.ID, a.HostAlias, a.FromState, a.ToState, a.Recovered, a.Reason)
+			}
+			return nil
+		},
+	}
+	reconcile.Flags().StringVar(&reconcileHost, "host", "", "reconcile only this host alias")
+	reconcile.Flags().BoolVar(&reconcileJSON, "json", false, "output JSON")
+	reconcile.Flags().BoolVar(&reconcileRecover, "recover", false, "attempt recover for newly quarantined entries")
+
+	root.AddCommand(up, down, status, restart, recover, reconcile, check, eventsCmd)
 	return root
 }
 

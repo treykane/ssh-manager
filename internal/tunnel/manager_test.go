@@ -326,6 +326,36 @@ func TestManagerLifecycleEmitsEvents(t *testing.T) {
 	}
 }
 
+func TestManagerReconcileQuarantinesSuspiciousRuntime(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := NewManager(fakeStarter{})
+
+	id := "api|127.0.0.1:9999|localhost:80"
+	m.runtime[id] = model.TunnelRuntime{
+		ID:        id,
+		HostAlias: "api",
+		Local:     "127.0.0.1:9999",
+		Remote:    "localhost:80",
+		State:     model.TunnelUp,
+		PID:       0,
+	}
+
+	actions, err := m.Reconcile("api", false)
+	if err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if len(actions) != 1 {
+		t.Fatalf("expected 1 action, got %d", len(actions))
+	}
+	got, err := m.Get(id)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.State != model.TunnelQuarantined {
+		t.Fatalf("expected quarantined state, got %s", got.State)
+	}
+}
+
 func TestManagerStart_RejectsPublicBindByDefault(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := NewManager(fakeStarter{})
