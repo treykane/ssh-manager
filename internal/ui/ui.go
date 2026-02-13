@@ -35,12 +35,14 @@ package ui
 import (
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/treykane/ssh-manager/internal/appconfig"
+	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/config"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
@@ -132,6 +134,11 @@ type dashboardModel struct {
 	// adHocHosts stores session-only hosts created via the form so they
 	// survive config reloads (press 'r').
 	adHocHosts []model.HostEntry
+
+	// bundle runner state.
+	bundleMode bool
+	bundles    []bundle.Definition
+	bundleSel  int
 }
 
 // initialModel creates the initial dashboardModel with loaded configuration,
@@ -317,6 +324,36 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 
+		// --- Bundle runner mode ---
+		if m.bundleMode {
+			switch msg.String() {
+			case "esc":
+				m.bundleMode = false
+				m.status = "Bundle runner closed"
+				return m, nil
+			case "j", "down":
+				if m.bundleSel < len(m.bundles)-1 {
+					m.bundleSel++
+				}
+				return m, nil
+			case "k", "up":
+				if m.bundleSel > 0 {
+					m.bundleSel--
+				}
+				return m, nil
+			case "enter":
+				if len(m.bundles) == 0 {
+					m.bundleMode = false
+					m.status = "No bundles saved"
+					return m, nil
+				}
+				m.status = m.runBundle(m.bundles[m.bundleSel])
+				m.bundleMode = false
+				m.tunnels = m.mgr.Snapshot()
+				return m, nil
+			}
+		}
+
 		// --- Normal mode: process navigation and action keys ---
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -377,6 +414,17 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// Open the new connection configurator form.
 			m.form = newForm()
 			m.status = "New connection: choose Quick Connect or Full Config"
+
+		case "b":
+			bs, err := bundle.LoadAll()
+			if err != nil {
+				m.status = "Bundle load failed: " + security.UserMessage(err, m.cfg.Security.RedactErrors)
+				break
+			}
+			m.bundles = bs
+			m.bundleSel = 0
+			m.bundleMode = true
+			m.status = "Bundle runner: choose bundle and press Enter"
 
 		case "t":
 			// Toggle the first LocalForward tunnel for the selected host.
@@ -583,7 +631,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | b bundles | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -591,6 +639,8 @@ func (m dashboardModel) View() string {
 	var main string
 	if m.form != nil {
 		main = m.form.view(m.renderPanel, m.effectiveWidth())
+	} else if m.bundleMode {
+		main = m.renderPanel("Bundle Runner", m.bundleView(), m.effectiveWidth(), lipgloss.Color("214"))
 	} else {
 		// renderMainPanels handles responsive layout: side-by-side panels on
 		// wide terminals (>= 96 cols), stacked vertically on narrow ones.
@@ -758,12 +808,85 @@ func (m dashboardModel) helpBlock() string {
 		"  Filtering: press /, type alias/host text, then Enter.",
 		"  Connect: press Enter on selected host.",
 		"  New: press n to configure a new SSH connection.",
+		"  Bundles: press b to open the bundle runner.",
 		"  Preflight: press c to validate selected host forwards before start.",
 		"  Tunnel: t toggles first forward; T processes all forwards; R restarts first forward.",
 		"  Recovery: press C to recover quarantined tunnels for selected host.",
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",
 	}, "\n")
+}
+
+func (m dashboardModel) bundleView() string {
+	if len(m.bundles) == 0 {
+		return "(no bundles)\nCreate one with: ssh-manager bundle create <name> --host <alias>\n\nEsc to close"
+	}
+	var b strings.Builder
+	b.WriteString("Choose bundle:\n\n")
+	for i, def := range m.bundles {
+		cursor := "  "
+		if i == m.bundleSel {
+			cursor = "> "
+		}
+		b.WriteString(fmt.Sprintf("%s%-22s entries=%d\n", cursor, def.Name, len(def.Entries)))
+	}
+	b.WriteString("\nEnter run | Esc cancel")
+	return b.String()
+}
+
+func (m *dashboardModel) runBundle(def bundle.Definition) string {
+	started := 0
+	failed := 0
+	for _, entry := range def.Entries {
+		host, ok := m.hostByAlias(entry.HostAlias)
+		if !ok {
+			failed++
+			continue
+		}
+		forwards, err := resolveBundleForwards(host, entry.ForwardSelector)
+		if err != nil {
+			failed++
+			continue
+		}
+		for _, fwd := range forwards {
+			if _, err := m.mgr.Start(host, fwd); err != nil {
+				failed++
+			} else {
+				started++
+			}
+		}
+	}
+	return fmt.Sprintf("Bundle %s finished: started=%d failed=%d", def.Name, started, failed)
+}
+
+func (m dashboardModel) hostByAlias(alias string) (model.HostEntry, bool) {
+	for _, h := range m.hosts {
+		if h.Alias == alias {
+			return h, true
+		}
+	}
+	return model.HostEntry{}, false
+}
+
+func resolveBundleForwards(host model.HostEntry, selector string) ([]model.ForwardSpec, error) {
+	selector = strings.TrimSpace(selector)
+	if selector == "" {
+		if len(host.Forwards) == 0 {
+			return nil, fmt.Errorf("host %s has no LocalForward entries", host.Alias)
+		}
+		return host.Forwards, nil
+	}
+	if idx, err := strconv.Atoi(selector); err == nil {
+		if idx < 0 || idx >= len(host.Forwards) {
+			return nil, fmt.Errorf("forward index out of range")
+		}
+		return []model.ForwardSpec{host.Forwards[idx]}, nil
+	}
+	fwd, err := tunnel.ParseForwardArg(selector)
+	if err != nil {
+		return nil, err
+	}
+	return []model.ForwardSpec{fwd}, nil
 }
 
 func (m *dashboardModel) toggleForward(host model.HostEntry, idx int) string {

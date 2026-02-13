@@ -32,6 +32,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/treykane/ssh-manager/internal/appconfig"
+	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/config"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
@@ -66,6 +67,7 @@ func NewRootCommand() *cobra.Command {
 
 	root.AddCommand(newListCmd())
 	root.AddCommand(newTunnelCmd())
+	root.AddCommand(newBundleCmd())
 	root.AddCommand(newSecurityCmd())
 	return root
 }
@@ -511,6 +513,137 @@ func effectiveHostKeyPolicy(cfg appconfig.Config, override string) string {
 		return appconfig.NormalizeHostKeyPolicy(strings.TrimSpace(override))
 	}
 	return cfg.Security.HostKeyPolicy
+}
+
+func newBundleCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "bundle",
+		Short: "Manage named tunnel bundles",
+	}
+
+	list := &cobra.Command{
+		Use:   "list",
+		Short: "List saved bundles",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			all, err := bundle.LoadAll()
+			if err != nil {
+				return err
+			}
+			if len(all) == 0 {
+				fmt.Println("(no bundles)")
+				return nil
+			}
+			fmt.Printf("%-24s %s\n", "NAME", "ENTRIES")
+			for _, b := range all {
+				fmt.Printf("%-24s %d\n", b.Name, len(b.Entries))
+			}
+			return nil
+		},
+	}
+
+	var createHosts []string
+	var createForwards []string
+	create := &cobra.Command{
+		Use:   "create <name>",
+		Short: "Create or replace a bundle",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if len(createHosts) == 0 {
+				return fmt.Errorf("at least one --host is required")
+			}
+			entries := make([]bundle.Entry, 0, len(createHosts))
+			for i, host := range createHosts {
+				fwd := ""
+				if i < len(createForwards) {
+					fwd = createForwards[i]
+				}
+				entries = append(entries, bundle.Entry{HostAlias: host, ForwardSelector: fwd})
+			}
+			if err := bundle.Create(args[0], entries); err != nil {
+				return err
+			}
+			fmt.Printf("saved bundle %s with %d entries\n", args[0], len(entries))
+			return nil
+		},
+	}
+	create.Flags().StringArrayVar(&createHosts, "host", nil, "host alias entry (repeatable)")
+	create.Flags().StringArrayVar(&createForwards, "forward", nil, "forward selector aligned by index to --host (optional, repeatable)")
+
+	run := &cobra.Command{
+		Use:   "run <name>",
+		Short: "Run a bundle and start its tunnels",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			def, err := bundle.Get(args[0])
+			if err != nil {
+				return err
+			}
+			client := sshclient.New()
+			mgr := tunnel.NewManager(client)
+			cfg, cfgErr := appconfig.Load()
+			if cfgErr != nil {
+				slog.Warn("failed to load config, using defaults", "error", cfgErr)
+				cfg = appconfig.Default()
+			}
+			mgr.SetBindPolicy(cfg.Security.BindPolicy)
+			mgr.SetRedactErrors(cfg.Security.RedactErrors)
+			mgr.SetRestartPolicy(
+				cfg.Tunnel.AutoRestart,
+				cfg.Tunnel.RestartMaxAttempts,
+				cfg.Tunnel.RestartBackoffSeconds,
+				cfg.Tunnel.RestartStableWindowSeconds,
+			)
+			client.SetHostKeyPolicy(cfg.Security.HostKeyPolicy)
+			_ = mgr.LoadRuntime()
+
+			started := 0
+			failed := 0
+			for _, entry := range def.Entries {
+				host, err := findHost(entry.HostAlias)
+				if err != nil {
+					failed++
+					fmt.Printf("failed %s: %v\n", entry.HostAlias, err)
+					continue
+				}
+				forwards, err := resolveForwards(host, entry.ForwardSelector)
+				if err != nil {
+					failed++
+					fmt.Printf("failed %s: %v\n", entry.HostAlias, err)
+					continue
+				}
+				for _, fwd := range forwards {
+					rt, err := mgr.Start(host, fwd)
+					if err != nil {
+						failed++
+						fmt.Printf("failed %s %s:%d -> %s:%d: %s\n",
+							host.Alias, fwd.LocalString(), fwd.LocalPort, fwd.RemoteString(), fwd.RemotePort,
+							security.UserMessage(err, cfg.Security.RedactErrors))
+						continue
+					}
+					started++
+					fmt.Printf("started %s pid=%d\n", rt.ID, rt.PID)
+				}
+			}
+			fmt.Printf("bundle %s summary: started=%d failed=%d\n", def.Name, started, failed)
+			return nil
+		},
+	}
+
+	del := &cobra.Command{
+		Use:   "delete <name>",
+		Short: "Delete a bundle",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := bundle.Delete(args[0]); err != nil {
+				return err
+			}
+			fmt.Printf("deleted bundle %s\n", args[0])
+			return nil
+		},
+	}
+
+	cmd.AddCommand(list, create, run, del)
+	return cmd
 }
 
 func newSecurityCmd() *cobra.Command {

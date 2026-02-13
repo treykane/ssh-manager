@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 )
 
@@ -66,6 +67,52 @@ func TestTunnelRecoverHostErrorWhenNoQuarantined(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no quarantined tunnel for host") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestBundleCreateListDeleteLifecycle(t *testing.T) {
+	setupSSHConfigForCLI(t)
+
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"bundle", "create", "daily", "--host", "api", "--forward", "0"})
+	if _, err := captureStdout(func() error { return cmd.Execute() }); err != nil {
+		t.Fatalf("create bundle: %v", err)
+	}
+
+	cmd = NewRootCommand()
+	cmd.SetArgs([]string{"bundle", "list"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("list bundle: %v", err)
+	}
+	if !strings.Contains(out, "daily") {
+		t.Fatalf("expected bundle in list output, got: %s", out)
+	}
+
+	cmd = NewRootCommand()
+	cmd.SetArgs([]string{"bundle", "delete", "daily"})
+	if _, err := captureStdout(func() error { return cmd.Execute() }); err != nil {
+		t.Fatalf("delete bundle: %v", err)
+	}
+}
+
+func TestBundleRunReturnsSummaryOnPartialFailures(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	if err := bundle.Create("mixed", []bundle.Entry{
+		{HostAlias: "api", ForwardSelector: "0"},
+		{HostAlias: "missing"},
+	}); err != nil {
+		t.Fatalf("create bundle: %v", err)
+	}
+
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"bundle", "run", "mixed"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("run bundle: %v", err)
+	}
+	if !strings.Contains(out, "bundle mixed summary:") {
+		t.Fatalf("expected summary output, got: %s", out)
 	}
 }
 
