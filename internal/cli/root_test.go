@@ -199,6 +199,66 @@ func TestTunnelEventsJSONOutput(t *testing.T) {
 	}
 }
 
+func TestTunnelStatusJSONFilters(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	writeRuntimeForCLI(t, []map[string]any{
+		{
+			"id":             "api|127.0.0.1:9501|localhost:80",
+			"host_alias":     "api",
+			"local":          "127.0.0.1:9501",
+			"remote":         "localhost:80",
+			"state":          "down",
+			"pid":            0,
+			"uptime_seconds": 0,
+			"latency_ms":     0,
+		},
+		{
+			"id":             "db|127.0.0.1:9502|localhost:80",
+			"host_alias":     "db",
+			"local":          "127.0.0.1:9502",
+			"remote":         "localhost:80",
+			"state":          "down",
+			"pid":            0,
+			"uptime_seconds": 0,
+			"latency_ms":     0,
+		},
+	})
+
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"tunnel", "status", "--host", "api", "--state", "down", "--limit", "1", "--json"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("status json: %v", err)
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid status json: %v", err)
+	}
+	if len(payload) != 1 || payload[0]["host_alias"] != "api" {
+		t.Fatalf("unexpected payload: %+v", payload)
+	}
+}
+
+func TestTunnelStatusInvalidState(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"tunnel", "status", "--state", "bogus"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "invalid --state value") {
+		t.Fatalf("expected invalid state error, got: %v", err)
+	}
+}
+
+func TestTunnelStatusWatchJSONRejected(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"tunnel", "status", "--watch", "--json"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "--watch cannot be combined with --json") {
+		t.Fatalf("expected watch/json error, got: %v", err)
+	}
+}
+
 func captureStdout(fn func() error) (string, error) {
 	orig := os.Stdout
 	r, w, err := os.Pipe()
@@ -236,5 +296,24 @@ func setupSSHConfigForCLI(t *testing.T) {
 	}, "\n")
 	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func writeRuntimeForCLI(t *testing.T, rows []map[string]any) {
+	t.Helper()
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	if xdg == "" {
+		t.Fatal("XDG_CONFIG_HOME must be set")
+	}
+	dir := filepath.Join(xdg, "ssh-manager")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir runtime dir: %v", err)
+	}
+	b, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatalf("marshal runtime: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "runtime.json"), b, 0o600); err != nil {
+		t.Fatalf("write runtime: %v", err)
 	}
 }

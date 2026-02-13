@@ -142,9 +142,10 @@ type dashboardModel struct {
 	bundles    []bundle.Definition
 	bundleSel  int
 
-	recentFirst  bool
-	showEvents   bool
-	recentEvents []events.Event
+	recentFirst       bool
+	showEvents        bool
+	recentEvents      []events.Event
+	tunnelStateFilter string
 }
 
 // initialModel creates the initial dashboardModel with loaded configuration,
@@ -184,6 +185,7 @@ func initialModel() dashboardModel {
 	m := dashboardModel{cfg: cfg, mgr: mgr, ssh: ssh}
 	m.reloadConfig()
 	m.refreshEvents(20)
+	m.tunnelStateFilter = "all"
 	m.status = "Ready. Select a host, Enter to connect, t for first tunnel, T for all."
 	return m
 }
@@ -407,6 +409,10 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Recent-first sorting disabled"
 			}
 
+		case "s":
+			m.tunnelStateFilter = nextTunnelFilter(m.tunnelStateFilter)
+			m.status = "Tunnel filter: " + m.tunnelStateFilter
+
 		case "e":
 			m.showEvents = !m.showEvents
 			if m.showEvents {
@@ -583,8 +589,9 @@ func (m dashboardModel) View() string {
 	head := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39")).Render("SSH Manager Dashboard")
 
 	// Summary statistics line showing counts and refresh interval.
-	subhead := fmt.Sprintf("hosts=%d shown=%d tunnels=%d refresh=%ds",
-		len(m.hosts), len(m.filtered), len(m.tunnels), clampRefresh(m.cfg.UI.RefreshSeconds))
+	visibleTunnels := m.filteredTunnels()
+	subhead := fmt.Sprintf("hosts=%d shown=%d tunnels=%d filter=%s refresh=%ds",
+		len(m.hosts), len(m.filtered), len(visibleTunnels), m.tunnelStateFilter, clampRefresh(m.cfg.UI.RefreshSeconds))
 
 	// --- Hosts panel (left side) ---
 
@@ -641,10 +648,10 @@ func (m dashboardModel) View() string {
 
 	tbl := strings.Builder{}
 	tbl.WriteString(fmt.Sprintf("%-24s %-20s %-20s %-10s %-8s %-8s\n", "HOST", "LOCAL", "REMOTE", "STATE", "PID", "LAT"))
-	for _, rt := range m.tunnels {
+	for _, rt := range visibleTunnels {
 		tbl.WriteString(fmt.Sprintf("%-24s %-20s %-20s %-10s %-8d %-8d\n", rt.HostAlias, rt.Local, rt.Remote, rt.State, rt.PID, rt.LatencyMS))
 	}
-	if len(m.tunnels) == 0 {
+	if len(visibleTunnels) == 0 {
 		tbl.WriteString("(none)\n")
 	}
 
@@ -664,7 +671,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | b bundles | h recent-sort | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | e events | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | b bundles | h recent-sort | s tunnel-filter | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | e events | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -767,6 +774,32 @@ func (m dashboardModel) hostHasQuarantinedTunnel(alias string) bool {
 	return false
 }
 
+func (m dashboardModel) filteredTunnels() []model.TunnelRuntime {
+	if m.tunnelStateFilter == "" || m.tunnelStateFilter == "all" {
+		return append([]model.TunnelRuntime(nil), m.tunnels...)
+	}
+	out := make([]model.TunnelRuntime, 0, len(m.tunnels))
+	for _, rt := range m.tunnels {
+		if string(rt.State) == m.tunnelStateFilter {
+			out = append(out, rt)
+		}
+	}
+	return out
+}
+
+func nextTunnelFilter(curr string) string {
+	switch curr {
+	case "all":
+		return "up"
+	case "up":
+		return "error"
+	case "error":
+		return "quarantined"
+	default:
+		return "all"
+	}
+}
+
 // guidanceForHost generates contextual "next steps" text for the detail panel
 // based on the selected host's configuration and current tunnel state.
 //
@@ -844,6 +877,7 @@ func (m dashboardModel) helpBlock() string {
 	return strings.Join([]string{
 		"  Navigation: j/k or arrow keys move selection.",
 		"  Sorting: press h to toggle recent-first host ordering.",
+		"  Tunnel filter: press s to cycle all/up/error/quarantined.",
 		"  Filtering: press /, type alias/host text, then Enter.",
 		"  Connect: press Enter on selected host.",
 		"  New: press n to configure a new SSH connection.",

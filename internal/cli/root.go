@@ -344,6 +344,12 @@ func newTunnelCmd() *cobra.Command {
 
 	// jsonOut is the --json flag for the "status" subcommand.
 	var jsonOut bool
+	var statusHost string
+	var statusState string
+	var statusLimit int
+	var statusWatch bool
+	var statusInterval int
+	var statusSummary bool
 	var checkForwardArg string
 	var checkJSON bool
 	var eventsHost string
@@ -357,31 +363,68 @@ func newTunnelCmd() *cobra.Command {
 		Use:   "status",
 		Short: "Show tunnel status",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Get a snapshot of all tunnels with health-check data.
-			sn := mgr.Snapshot()
-
-			// Sort by ID for deterministic output (important for scripting
-			// and for consistent visual ordering).
-			sort.Slice(sn, func(i, j int) bool { return sn[i].ID < sn[j].ID })
-
-			if jsonOut {
-				// JSON output mode: emit the full snapshot as a JSON array.
-				// Field names are stable (see model.TunnelRuntime doc comment)
-				// and form the public API contract for programmatic consumers.
-				enc := json.NewEncoder(os.Stdout)
-				enc.SetIndent("", "  ")
-				return enc.Encode(sn)
+			if statusWatch && jsonOut {
+				return fmt.Errorf("--watch cannot be combined with --json")
+			}
+			stateFilter := strings.TrimSpace(statusState)
+			if stateFilter != "" && !isKnownTunnelState(stateFilter) {
+				return fmt.Errorf("invalid --state value %q", stateFilter)
+			}
+			interval := statusInterval
+			if interval <= 0 {
+				interval = 3
 			}
 
-			// Table output mode: print a human-readable table.
-			fmt.Printf("%-42s %-16s %-22s %-22s %-10s %-8s %-10s\n", "ID", "HOST", "LOCAL", "REMOTE", "STATE", "PID", "LAT(ms)")
-			for _, rt := range sn {
-				fmt.Printf("%-42s %-16s %-22s %-22s %-10s %-8d %-10d\n", rt.ID, rt.HostAlias, rt.Local, rt.Remote, rt.State, rt.PID, rt.LatencyMS)
+			render := func() error {
+				sn := mgr.Snapshot()
+				sort.Slice(sn, func(i, j int) bool { return sn[i].ID < sn[j].ID })
+				sn = filterTunnelSnapshot(sn, statusHost, stateFilter, statusLimit)
+
+				if jsonOut {
+					enc := json.NewEncoder(os.Stdout)
+					enc.SetIndent("", "  ")
+					return enc.Encode(sn)
+				}
+
+				if statusSummary {
+					printTunnelSummary(sn)
+				}
+				fmt.Printf("%-42s %-16s %-22s %-22s %-12s %-8s %-10s\n", "ID", "HOST", "LOCAL", "REMOTE", "STATE", "PID", "LAT(ms)")
+				for _, rt := range sn {
+					fmt.Printf("%-42s %-16s %-22s %-22s %-12s %-8d %-10d\n", rt.ID, rt.HostAlias, rt.Local, rt.Remote, rt.State, rt.PID, rt.LatencyMS)
+				}
+				if len(sn) == 0 {
+					fmt.Println("(none)")
+				}
+				return nil
 			}
-			return nil
+
+			if !statusWatch {
+				return render()
+			}
+
+			for {
+				fmt.Print("\033[H\033[2J")
+				fmt.Printf("watching tunnel status (interval=%ds host=%s state=%s limit=%d)\n\n",
+					interval,
+					util.EmptyDash(strings.TrimSpace(statusHost)),
+					util.EmptyDash(stateFilter),
+					statusLimit,
+				)
+				if err := render(); err != nil {
+					return err
+				}
+				time.Sleep(time.Duration(interval) * time.Second)
+			}
 		},
 	}
 	status.Flags().BoolVar(&jsonOut, "json", false, "output JSON")
+	status.Flags().StringVar(&statusHost, "host", "", "filter rows by host alias")
+	status.Flags().StringVar(&statusState, "state", "", "filter rows by state (up, down, error, quarantined, starting, stopping)")
+	status.Flags().IntVar(&statusLimit, "limit", 0, "max rows to display (0 = no limit)")
+	status.Flags().BoolVar(&statusWatch, "watch", false, "continuously refresh output until interrupted")
+	status.Flags().IntVar(&statusInterval, "interval", 3, "watch interval in seconds")
+	status.Flags().BoolVar(&statusSummary, "summary", false, "print state counts and non-healthy tunnels before table")
 
 	check := &cobra.Command{
 		Use:   "check <host>",
@@ -494,6 +537,63 @@ func parseSince(s string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("invalid --since value %q: use duration (e.g. 1h) or RFC3339", s)
 	}
 	return t, nil
+}
+
+func filterTunnelSnapshot(in []model.TunnelRuntime, host, state string, limit int) []model.TunnelRuntime {
+	host = strings.TrimSpace(host)
+	state = strings.TrimSpace(state)
+	out := make([]model.TunnelRuntime, 0, len(in))
+	for _, rt := range in {
+		if host != "" && rt.HostAlias != host {
+			continue
+		}
+		if state != "" && string(rt.State) != state {
+			continue
+		}
+		out = append(out, rt)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
+	return out
+}
+
+func isKnownTunnelState(v string) bool {
+	switch model.TunnelState(v) {
+	case model.TunnelUp, model.TunnelDown, model.TunnelError, model.TunnelQuarantined, model.TunnelStarting, model.TunnelStopping:
+		return true
+	default:
+		return false
+	}
+}
+
+func printTunnelSummary(sn []model.TunnelRuntime) {
+	counts := map[model.TunnelState]int{
+		model.TunnelUp:          0,
+		model.TunnelDown:        0,
+		model.TunnelError:       0,
+		model.TunnelQuarantined: 0,
+		model.TunnelStarting:    0,
+		model.TunnelStopping:    0,
+	}
+	for _, rt := range sn {
+		counts[rt.State]++
+	}
+	fmt.Printf("summary: up=%d down=%d error=%d quarantined=%d starting=%d stopping=%d total=%d\n",
+		counts[model.TunnelUp],
+		counts[model.TunnelDown],
+		counts[model.TunnelError],
+		counts[model.TunnelQuarantined],
+		counts[model.TunnelStarting],
+		counts[model.TunnelStopping],
+		len(sn),
+	)
+	for _, rt := range sn {
+		if rt.State == model.TunnelError || rt.State == model.TunnelQuarantined || rt.State == model.TunnelStarting || rt.State == model.TunnelStopping {
+			fmt.Printf("  non-healthy: %s state=%s pid=%d error=%s\n", rt.ID, rt.State, rt.PID, util.EmptyDash(rt.LastError))
+		}
+	}
+	fmt.Println()
 }
 
 func forwardFromRuntime(rt model.TunnelRuntime) (model.ForwardSpec, error) {
