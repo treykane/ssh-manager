@@ -143,6 +143,12 @@ func newTunnelCmd() *cobra.Command {
 	}
 	mgr.SetBindPolicy(cfg.Security.BindPolicy)
 	mgr.SetRedactErrors(cfg.Security.RedactErrors)
+	mgr.SetRestartPolicy(
+		cfg.Tunnel.AutoRestart,
+		cfg.Tunnel.RestartMaxAttempts,
+		cfg.Tunnel.RestartBackoffSeconds,
+		cfg.Tunnel.RestartStableWindowSeconds,
+	)
 	client.SetHostKeyPolicy(cfg.Security.HostKeyPolicy)
 
 	// Restore persisted tunnel state from disk. This allows "tunnel status" to

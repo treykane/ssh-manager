@@ -154,6 +154,12 @@ func initialModel() dashboardModel {
 	mgr := tunnel.NewManager(ssh)
 	mgr.SetBindPolicy(cfg.Security.BindPolicy)
 	mgr.SetRedactErrors(cfg.Security.RedactErrors)
+	mgr.SetRestartPolicy(
+		cfg.Tunnel.AutoRestart,
+		cfg.Tunnel.RestartMaxAttempts,
+		cfg.Tunnel.RestartBackoffSeconds,
+		cfg.Tunnel.RestartStableWindowSeconds,
+	)
 	ssh.SetHostKeyPolicy(cfg.Security.HostKeyPolicy)
 
 	// Restore tunnel state from a previous session. If the runtime file

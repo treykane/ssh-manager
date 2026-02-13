@@ -49,6 +49,7 @@ import (
 	"time"
 
 	"github.com/treykane/ssh-manager/internal/appconfig"
+	"github.com/treykane/ssh-manager/internal/config"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
@@ -99,6 +100,13 @@ type Manager struct {
 
 	// redactErrors controls whether stored/displayed errors should hide home paths.
 	redactErrors bool
+
+	// restart policy controls.
+	autoRestart        bool
+	restartMaxAttempts int
+	restartBackoff     time.Duration
+	restartStable      time.Duration
+	restartAttempts    map[string]int
 }
 
 // PreflightFinding captures one check result in a tunnel preflight run.
@@ -135,11 +143,16 @@ type TunnelStarter interface {
 // restore any previously persisted tunnel state from disk.
 func NewManager(client TunnelStarter) *Manager {
 	return &Manager{
-		client:       client,
-		runtime:      make(map[string]model.TunnelRuntime),
-		cancel:       make(map[string]context.CancelFunc),
-		bindPolicy:   appconfig.BindPolicyLoopbackOnly,
-		redactErrors: true,
+		client:             client,
+		runtime:            make(map[string]model.TunnelRuntime),
+		cancel:             make(map[string]context.CancelFunc),
+		bindPolicy:         appconfig.BindPolicyLoopbackOnly,
+		redactErrors:       true,
+		autoRestart:        true,
+		restartMaxAttempts: 3,
+		restartBackoff:     2 * time.Second,
+		restartStable:      30 * time.Second,
+		restartAttempts:    make(map[string]int),
 	}
 }
 
@@ -153,6 +166,23 @@ func (m *Manager) SetAllowPublicBind(allow bool) {
 
 func (m *Manager) SetRedactErrors(redact bool) {
 	m.redactErrors = redact
+}
+
+// SetRestartPolicy updates auto-restart behavior for unexpected tunnel exits.
+func (m *Manager) SetRestartPolicy(autoRestart bool, maxAttempts, backoffSeconds, stableWindowSeconds int) {
+	m.autoRestart = autoRestart
+	if maxAttempts < 0 {
+		maxAttempts = 0
+	}
+	if backoffSeconds <= 0 {
+		backoffSeconds = 2
+	}
+	if stableWindowSeconds <= 0 {
+		stableWindowSeconds = 30
+	}
+	m.restartMaxAttempts = maxAttempts
+	m.restartBackoff = time.Duration(backoffSeconds) * time.Second
+	m.restartStable = time.Duration(stableWindowSeconds) * time.Second
 }
 
 // Preflight validates a single tunnel forward without starting a process.
@@ -339,6 +369,7 @@ func (m *Manager) Start(host model.HostEntry, fwd model.ForwardSpec) (model.Tunn
 	rt.State = model.TunnelUp
 	m.runtime[id] = rt
 	m.mu.Unlock()
+	m.scheduleRestartReset(id, rt.StartedAt)
 
 	// Spawn a goroutine to wait for the SSH process to exit. This goroutine
 	// will update the tunnel state to "down" or "error" when the process
@@ -382,6 +413,23 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 	// from Stop(), don't overwrite it with process-exit derived values.
 	if rt.State != model.TunnelStopping && rt.State != model.TunnelDown {
 		if err != nil {
+			if m.autoRestart {
+				attempt := m.restartAttempts[id] + 1
+				if attempt <= m.restartMaxAttempts {
+					m.restartAttempts[id] = attempt
+					rt.State = model.TunnelError
+					rt.LastError = fmt.Sprintf("unexpected exit; auto-restart attempt %d/%d", attempt, m.restartMaxAttempts)
+					m.runtime[id] = rt
+					delete(m.cancel, id)
+					m.mu.Unlock()
+
+					if persistErr := m.persist(); persistErr != nil {
+						slog.Warn("failed to persist tunnel state after restart scheduling", "error", persistErr)
+					}
+					go m.restartAfterDelay(id, rt, attempt)
+					return
+				}
+			}
 			rt.State = model.TunnelError
 			rt.LastError = security.UserMessage(err, m.redactErrors)
 		} else {
@@ -398,6 +446,66 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 	if persistErr := m.persist(); persistErr != nil {
 		slog.Warn("failed to persist tunnel state after process exit", "error", persistErr)
 	}
+}
+
+func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt int) {
+	time.Sleep(m.restartBackoff)
+
+	host, err := findHostByAlias(prev.HostAlias)
+	if err != nil {
+		m.mu.Lock()
+		rt := m.runtime[id]
+		rt.State = model.TunnelError
+		rt.LastError = fmt.Sprintf("auto-restart attempt %d/%d failed: %v", attempt, m.restartMaxAttempts, err)
+		m.runtime[id] = rt
+		m.mu.Unlock()
+		_ = m.persist()
+		return
+	}
+
+	fwd := prev.Forward
+	if fwd.LocalPort == 0 || fwd.RemotePort == 0 {
+		parsed, perr := ParseForwardArg(fmt.Sprintf("%s:%s", prev.Local, prev.Remote))
+		if perr != nil {
+			m.mu.Lock()
+			rt := m.runtime[id]
+			rt.State = model.TunnelError
+			rt.LastError = fmt.Sprintf("auto-restart attempt %d/%d failed: %v", attempt, m.restartMaxAttempts, perr)
+			m.runtime[id] = rt
+			m.mu.Unlock()
+			_ = m.persist()
+			return
+		}
+		fwd = parsed
+	}
+
+	if _, serr := m.Start(host, fwd); serr != nil {
+		m.mu.Lock()
+		rt := m.runtime[id]
+		rt.State = model.TunnelError
+		rt.LastError = fmt.Sprintf("auto-restart attempt %d/%d failed: %v", attempt, m.restartMaxAttempts, serr)
+		m.runtime[id] = rt
+		m.mu.Unlock()
+		_ = m.persist()
+	}
+}
+
+func (m *Manager) scheduleRestartReset(id string, startedAt time.Time) {
+	if m.restartStable <= 0 {
+		return
+	}
+	go func() {
+		time.Sleep(m.restartStable)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		rt, ok := m.runtime[id]
+		if !ok {
+			return
+		}
+		if rt.State == model.TunnelUp && rt.StartedAt.Equal(startedAt) {
+			m.restartAttempts[id] = 0
+		}
+	}()
 }
 
 // Stop terminates a tunnel by its ID.
@@ -919,6 +1027,19 @@ func isManagedTunnelProcess(cmdline string, rt model.TunnelRuntime) bool {
 		return false
 	}
 	return true
+}
+
+func findHostByAlias(alias string) (model.HostEntry, error) {
+	res, err := config.ParseDefault()
+	if err != nil {
+		return model.HostEntry{}, err
+	}
+	for _, h := range res.Hosts {
+		if h.Alias == alias {
+			return h, nil
+		}
+	}
+	return model.HostEntry{}, fmt.Errorf("host not found: %s", alias)
 }
 
 // processAlive checks whether a process with the given PID is still running.

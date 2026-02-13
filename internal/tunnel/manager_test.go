@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -47,6 +48,11 @@ import (
 // to simulate SSH process launch failures (e.g., binary not found, port in use).
 type fakeStarter struct {
 	fail bool
+}
+
+type flakyStarter struct {
+	failures int32
+	calls    int32
 }
 
 // StartTunnel implements TunnelStarter. If fail is true, it returns
@@ -78,6 +84,25 @@ func (f fakeStarter) StartTunnel(ctx context.Context, host model.HostEntry, fwd 
 		return nil, err
 	}
 
+	return &sshclient.TunnelProcess{Cmd: cmd, Stderr: stderr}, nil
+}
+
+func (f *flakyStarter) StartTunnel(ctx context.Context, host model.HostEntry, fwd model.ForwardSpec) (*sshclient.TunnelProcess, error) {
+	call := atomic.AddInt32(&f.calls, 1)
+	var cmd *exec.Cmd
+	if call <= atomic.LoadInt32(&f.failures) {
+		cmd = exec.CommandContext(ctx, "sh", "-c", "exit 1")
+	} else {
+		cmd = exec.CommandContext(ctx, "sleep", "30")
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		return nil, err
+	}
+	cmd.Stdout = io.Discard
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
 	return &sshclient.TunnelProcess{Cmd: cmd, Stderr: stderr}, nil
 }
 
@@ -367,5 +392,110 @@ func TestPreflight_FailsForPublicBindWithoutOverride(t *testing.T) {
 	rep := m.Preflight(h, fwd)
 	if rep.OK {
 		t.Fatalf("expected bind-policy failure, got %+v", rep)
+	}
+}
+
+func TestManagerAutoRestartUnexpectedExit(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSSHConfig(t, home, "api")
+
+	starter := &flakyStarter{failures: 1}
+	m := NewManager(starter)
+	m.SetRestartPolicy(true, 2, 1, 1)
+
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9511, RemoteAddr: "localhost", RemotePort: 80}
+	rt, err := m.Start(h, fwd)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer func() { _ = m.Stop(rt.ID) }()
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		got, gerr := m.Get(rt.ID)
+		if gerr == nil && got.State == model.TunnelUp && got.PID > 0 && atomic.LoadInt32(&starter.calls) >= 2 {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	got, _ := m.Get(rt.ID)
+	t.Fatalf("expected restarted tunnel to become up; state=%s calls=%d", got.State, starter.calls)
+}
+
+func TestManagerAutoRestartStopsAtMaxAttempts(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSSHConfig(t, home, "api")
+
+	starter := &flakyStarter{failures: 10}
+	m := NewManager(starter)
+	m.SetRestartPolicy(true, 2, 1, 1)
+
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9512, RemoteAddr: "localhost", RemotePort: 80}
+	rt, err := m.Start(h, fwd)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	time.Sleep(3500 * time.Millisecond)
+	got, gerr := m.Get(rt.ID)
+	if gerr != nil {
+		t.Fatal(gerr)
+	}
+	if got.State != model.TunnelError {
+		t.Fatalf("expected error state after max attempts, got %s", got.State)
+	}
+	if atomic.LoadInt32(&starter.calls) != 3 {
+		t.Fatalf("expected initial + 2 restart attempts, got %d", starter.calls)
+	}
+}
+
+func TestManagerAutoRestartStableWindowResetsCounter(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSSHConfig(t, home, "api")
+
+	starter := &flakyStarter{failures: 0}
+	m := NewManager(starter)
+	m.SetRestartPolicy(true, 2, 1, 1)
+
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9513, RemoteAddr: "localhost", RemotePort: 80}
+	rt, err := m.Start(h, fwd)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+	defer func() { _ = m.Stop(rt.ID) }()
+
+	time.Sleep(1500 * time.Millisecond)
+	m.mu.Lock()
+	// Seed a non-zero counter and confirm stable window reset clears it.
+	m.restartAttempts[rt.ID] = 2
+	m.mu.Unlock()
+	m.scheduleRestartReset(rt.ID, rt.StartedAt)
+	time.Sleep(1500 * time.Millisecond)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.restartAttempts[rt.ID] != 0 {
+		t.Fatalf("expected restart counter reset, got %d", m.restartAttempts[rt.ID])
+	}
+}
+
+func writeSSHConfig(t *testing.T, home string, alias string) {
+	t.Helper()
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := "Host " + alias + "\n  HostName 127.0.0.1\n"
+	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }

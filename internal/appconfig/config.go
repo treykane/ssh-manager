@@ -57,6 +57,22 @@ type SecurityConfig struct {
 	RedactErrors bool `yaml:"redact_errors"`
 }
 
+// TunnelConfig controls automatic tunnel restart behavior.
+type TunnelConfig struct {
+	// AutoRestart enables automatic restart after unexpected tunnel exits.
+	AutoRestart bool `yaml:"auto_restart"`
+
+	// RestartMaxAttempts is the maximum restart attempts before giving up.
+	RestartMaxAttempts int `yaml:"restart_max_attempts"`
+
+	// RestartBackoffSeconds is the delay before each restart attempt.
+	RestartBackoffSeconds int `yaml:"restart_backoff_seconds"`
+
+	// RestartStableWindowSeconds is the uptime window after which failure
+	// counters are reset back to zero.
+	RestartStableWindowSeconds int `yaml:"restart_stable_window_seconds"`
+}
+
 // Config holds the top-level application configuration, loaded from config.yaml.
 // Fields map directly to YAML keys for straightforward editing by users.
 type Config struct {
@@ -70,6 +86,9 @@ type Config struct {
 
 	// Security contains app-wide security behavior defaults.
 	Security SecurityConfig `yaml:"security"`
+
+	// Tunnel contains auto-restart behavior for tunnel processes.
+	Tunnel TunnelConfig `yaml:"tunnel"`
 }
 
 // Default returns the default configuration values. These are used when:
@@ -88,6 +107,12 @@ func Default() Config {
 			HostKeyPolicy:   HostKeyPolicyStrict,
 			AuditLogEnabled: false,
 			RedactErrors:    true,
+		},
+		Tunnel: TunnelConfig{
+			AutoRestart:                true,
+			RestartMaxAttempts:         3,
+			RestartBackoffSeconds:      2,
+			RestartStableWindowSeconds: 30,
 		},
 	}
 }
@@ -197,6 +222,15 @@ func Load() (Config, error) {
 	}
 	cfg.Security.BindPolicy = NormalizeBindPolicy(cfg.Security.BindPolicy)
 	cfg.Security.HostKeyPolicy = NormalizeHostKeyPolicy(cfg.Security.HostKeyPolicy)
+	if cfg.Tunnel.RestartMaxAttempts < 0 {
+		cfg.Tunnel.RestartMaxAttempts = 0
+	}
+	if cfg.Tunnel.RestartBackoffSeconds <= 0 {
+		cfg.Tunnel.RestartBackoffSeconds = 2
+	}
+	if cfg.Tunnel.RestartStableWindowSeconds <= 0 {
+		cfg.Tunnel.RestartStableWindowSeconds = 30
+	}
 
 	return cfg, nil
 }
