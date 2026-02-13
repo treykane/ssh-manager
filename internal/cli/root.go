@@ -35,6 +35,7 @@ import (
 	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/config"
 	"github.com/treykane/ssh-manager/internal/doctor"
+	"github.com/treykane/ssh-manager/internal/events"
 	"github.com/treykane/ssh-manager/internal/history"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
@@ -345,6 +346,12 @@ func newTunnelCmd() *cobra.Command {
 	var jsonOut bool
 	var checkForwardArg string
 	var checkJSON bool
+	var eventsHost string
+	var eventsID string
+	var eventsType string
+	var eventsSince string
+	var eventsLimit int
+	var eventsJSON bool
 
 	status := &cobra.Command{
 		Use:   "status",
@@ -420,8 +427,73 @@ func newTunnelCmd() *cobra.Command {
 	check.Flags().StringVar(&checkForwardArg, "forward", "", "forward index (0-based) or explicit spec localPort:remoteHost:remotePort")
 	check.Flags().BoolVar(&checkJSON, "json", false, "output JSON")
 
-	root.AddCommand(up, down, status, restart, recover, check)
+	eventsCmd := &cobra.Command{
+		Use:   "events",
+		Short: "Show tunnel lifecycle events",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			since, err := parseSince(eventsSince)
+			if err != nil {
+				return err
+			}
+			recs, err := mgr.Events(events.Query{
+				HostAlias: strings.TrimSpace(eventsHost),
+				TunnelID:  strings.TrimSpace(eventsID),
+				EventType: strings.TrimSpace(eventsType),
+				Since:     since,
+				Limit:     eventsLimit,
+			})
+			if err != nil {
+				return err
+			}
+
+			if eventsJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(recs)
+			}
+
+			if len(recs) == 0 {
+				fmt.Println("(no events)")
+				return nil
+			}
+			fmt.Printf("%-25s %-18s %-16s %-12s %-8s %s\n", "TIMESTAMP", "EVENT", "HOST", "STATE", "PID", "MESSAGE")
+			for _, evt := range recs {
+				fmt.Printf("%-25s %-18s %-16s %-12s %-8d %s\n",
+					evt.Timestamp.Format(time.RFC3339),
+					evt.EventType,
+					util.EmptyDash(evt.HostAlias),
+					util.EmptyDash(string(evt.State)),
+					evt.PID,
+					evt.Message,
+				)
+			}
+			return nil
+		},
+	}
+	eventsCmd.Flags().StringVar(&eventsHost, "host", "", "filter by host alias")
+	eventsCmd.Flags().StringVar(&eventsID, "id", "", "filter by tunnel id")
+	eventsCmd.Flags().StringVar(&eventsType, "event", "", "filter by event type")
+	eventsCmd.Flags().StringVar(&eventsSince, "since", "", "filter by age duration (e.g. 1h) or RFC3339 timestamp")
+	eventsCmd.Flags().IntVar(&eventsLimit, "limit", 100, "maximum number of events to return")
+	eventsCmd.Flags().BoolVar(&eventsJSON, "json", false, "output JSON")
+
+	root.AddCommand(up, down, status, restart, recover, check, eventsCmd)
 	return root
+}
+
+func parseSince(s string) (time.Time, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return time.Time{}, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().Add(-d), nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid --since value %q: use duration (e.g. 1h) or RFC3339", s)
+	}
+	return t, nil
 }
 
 func forwardFromRuntime(rt model.TunnelRuntime) (model.ForwardSpec, error) {

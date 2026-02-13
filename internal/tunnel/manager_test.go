@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/treykane/ssh-manager/internal/appconfig"
+	"github.com/treykane/ssh-manager/internal/events"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 )
@@ -285,6 +286,43 @@ func TestSnapshotAddsUptime(t *testing.T) {
 	sn := m.Snapshot()
 	if len(sn) == 0 || sn[0].UptimeSec < 1 {
 		t.Fatalf("expected uptime to be populated, got %+v", sn)
+	}
+}
+
+func TestManagerLifecycleEmitsEvents(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := NewManager(fakeStarter{})
+
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9450, RemoteAddr: "localhost", RemotePort: 80}
+
+	rt, err := m.Start(h, fwd)
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if err := m.Stop(rt.ID); err != nil {
+		t.Fatalf("stop: %v", err)
+	}
+
+	recs, err := m.Events(events.Query{HostAlias: "api"})
+	if err != nil {
+		t.Fatalf("events read: %v", err)
+	}
+	if len(recs) == 0 {
+		t.Fatal("expected lifecycle events, got none")
+	}
+	seenStart := false
+	seenStop := false
+	for _, evt := range recs {
+		if evt.EventType == "start_succeeded" {
+			seenStart = true
+		}
+		if evt.EventType == "stop_succeeded" {
+			seenStop = true
+		}
+	}
+	if !seenStart || !seenStop {
+		t.Fatalf("expected start/stop events, got %+v", recs)
 	}
 }
 

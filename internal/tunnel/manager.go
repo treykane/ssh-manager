@@ -50,6 +50,7 @@ import (
 
 	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/config"
+	"github.com/treykane/ssh-manager/internal/events"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
 	"github.com/treykane/ssh-manager/internal/sshclient"
@@ -107,6 +108,9 @@ type Manager struct {
 	restartBackoff     time.Duration
 	restartStable      time.Duration
 	restartAttempts    map[string]int
+
+	// event journal for lifecycle observability.
+	eventStore *events.Store
 }
 
 // PreflightFinding captures one check result in a tunnel preflight run.
@@ -153,6 +157,31 @@ func NewManager(client TunnelStarter) *Manager {
 		restartBackoff:     2 * time.Second,
 		restartStable:      30 * time.Second,
 		restartAttempts:    make(map[string]int),
+		eventStore:         events.NewStore(),
+	}
+}
+
+func (m *Manager) Events(q events.Query) ([]events.Event, error) {
+	if m.eventStore == nil {
+		return nil, nil
+	}
+	return m.eventStore.Read(q)
+}
+
+func (m *Manager) recordEvent(eventType string, rt model.TunnelRuntime, message string) {
+	if m.eventStore == nil {
+		return
+	}
+	if err := m.eventStore.Append(events.Event{
+		Timestamp: time.Now().UTC(),
+		TunnelID:  rt.ID,
+		HostAlias: rt.HostAlias,
+		EventType: eventType,
+		State:     rt.State,
+		Message:   message,
+		PID:       rt.PID,
+	}); err != nil {
+		slog.Warn("failed to append tunnel event", "event", eventType, "error", err)
 	}
 }
 
@@ -343,6 +372,7 @@ func (m *Manager) Start(host model.HostEntry, fwd model.ForwardSpec) (model.Tunn
 	m.runtime[id] = rt
 	m.cancel[id] = cancel
 	m.mu.Unlock()
+	m.recordEvent("start_requested", rt, "start requested")
 
 	// Attempt to launch the SSH tunnel process. This calls the system SSH
 	// binary with -N -L flags (see sshclient.StartTunnel for details).
@@ -356,6 +386,7 @@ func (m *Manager) Start(host model.HostEntry, fwd model.ForwardSpec) (model.Tunn
 		m.runtime[id] = rt
 		delete(m.cancel, id) // No process to cancel; clean up the cancel func.
 		m.mu.Unlock()
+		m.recordEvent("start_failed", rt, rt.LastError)
 
 		if persistErr := m.persist(); persistErr != nil {
 			slog.Warn("failed to persist tunnel state after start error", "error", persistErr)
@@ -370,6 +401,7 @@ func (m *Manager) Start(host model.HostEntry, fwd model.ForwardSpec) (model.Tunn
 	m.runtime[id] = rt
 	m.mu.Unlock()
 	m.scheduleRestartReset(id, rt.StartedAt)
+	m.recordEvent("start_succeeded", rt, "tunnel started")
 
 	// Spawn a goroutine to wait for the SSH process to exit. This goroutine
 	// will update the tunnel state to "down" or "error" when the process
@@ -422,6 +454,8 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 					m.runtime[id] = rt
 					delete(m.cancel, id)
 					m.mu.Unlock()
+					m.recordEvent("unexpected_exit", rt, rt.LastError)
+					m.recordEvent("restart_attempt", rt, fmt.Sprintf("auto-restart attempt %d/%d scheduled", attempt, m.restartMaxAttempts))
 
 					if persistErr := m.persist(); persistErr != nil {
 						slog.Warn("failed to persist tunnel state after restart scheduling", "error", persistErr)
@@ -435,6 +469,8 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 				m.runtime[id] = rt
 				delete(m.cancel, id)
 				m.mu.Unlock()
+				m.recordEvent("unexpected_exit", rt, "unexpected tunnel exit")
+				m.recordEvent("quarantine", rt, rt.LastError)
 				if persistErr := m.persist(); persistErr != nil {
 					slog.Warn("failed to persist tunnel state after quarantine", "error", persistErr)
 				}
@@ -442,8 +478,10 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 			}
 			rt.State = model.TunnelError
 			rt.LastError = security.UserMessage(err, m.redactErrors)
+			m.recordEvent("unexpected_exit", rt, rt.LastError)
 		} else {
 			rt.State = model.TunnelDown
+			m.recordEvent("unexpected_exit", rt, "tunnel exited cleanly")
 		}
 		m.runtime[id] = rt
 	}
@@ -469,21 +507,30 @@ func (m *Manager) Recover(id string) (model.TunnelRuntime, error) {
 	if rt.State != model.TunnelQuarantined {
 		return model.TunnelRuntime{}, fmt.Errorf("tunnel is not quarantined: %s", id)
 	}
+	m.recordEvent("recover_requested", rt, "recover requested")
 	host, err := findHostByAlias(rt.HostAlias)
 	if err != nil {
+		m.recordEvent("recover_failed", rt, err.Error())
 		return model.TunnelRuntime{}, err
 	}
 	fwd := rt.Forward
 	if fwd.LocalPort == 0 || fwd.RemotePort == 0 {
 		fwd, err = ParseForwardArg(fmt.Sprintf("%s:%s", rt.Local, rt.Remote))
 		if err != nil {
+			m.recordEvent("recover_failed", rt, err.Error())
 			return model.TunnelRuntime{}, err
 		}
 	}
 	m.mu.Lock()
 	m.restartAttempts[id] = 0
 	m.mu.Unlock()
-	return m.Start(host, fwd)
+	next, err := m.Start(host, fwd)
+	if err != nil {
+		m.recordEvent("recover_failed", rt, security.UserMessage(err, m.redactErrors))
+		return model.TunnelRuntime{}, err
+	}
+	m.recordEvent("recover_succeeded", next, "recovered quarantined tunnel")
+	return next, nil
 }
 
 // RecoverByHost restarts all quarantined tunnels for a host alias.
@@ -522,6 +569,7 @@ func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt
 		rt.LastError = fmt.Sprintf("auto-restart attempt %d/%d failed: %v", attempt, m.restartMaxAttempts, err)
 		m.runtime[id] = rt
 		m.mu.Unlock()
+		m.recordEvent("restart_failure", rt, rt.LastError)
 		_ = m.persist()
 		return
 	}
@@ -536,21 +584,26 @@ func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt
 			rt.LastError = fmt.Sprintf("auto-restart attempt %d/%d failed: %v", attempt, m.restartMaxAttempts, perr)
 			m.runtime[id] = rt
 			m.mu.Unlock()
+			m.recordEvent("restart_failure", rt, rt.LastError)
 			_ = m.persist()
 			return
 		}
 		fwd = parsed
 	}
 
-	if _, serr := m.Start(host, fwd); serr != nil {
+	next, serr := m.Start(host, fwd)
+	if serr != nil {
 		m.mu.Lock()
 		rt := m.runtime[id]
 		rt.State = model.TunnelError
 		rt.LastError = fmt.Sprintf("auto-restart attempt %d/%d failed: %v", attempt, m.restartMaxAttempts, serr)
 		m.runtime[id] = rt
 		m.mu.Unlock()
+		m.recordEvent("restart_failure", rt, rt.LastError)
 		_ = m.persist()
+		return
 	}
+	m.recordEvent("restart_success", next, fmt.Sprintf("auto-restart attempt %d/%d succeeded", attempt, m.restartMaxAttempts))
 }
 
 func (m *Manager) scheduleRestartReset(id string, startedAt time.Time) {
@@ -597,6 +650,7 @@ func (m *Manager) Stop(id string) error {
 	m.runtime[id] = rt
 	cancel := m.cancel[id]
 	m.mu.Unlock()
+	m.recordEvent("stop_requested", rt, "stop requested")
 
 	// Cancel the context first. For exec.CommandContext, this sends SIGKILL
 	// to the process group.
@@ -620,6 +674,7 @@ func (m *Manager) Stop(id string) error {
 	m.runtime[id] = rt
 	delete(m.cancel, id)
 	m.mu.Unlock()
+	m.recordEvent("stop_succeeded", rt, "tunnel stopped")
 
 	if err := m.persist(); err != nil {
 		slog.Warn("failed to persist tunnel state after stop", "error", err)
@@ -850,6 +905,7 @@ func (m *Manager) LoadRuntime() error {
 			rt.LastError = "recovered runtime entry was quarantined (process mismatch)"
 			rt.PID = 0
 			m.runtime[rt.ID] = rt
+			m.recordEvent("quarantine", rt, rt.LastError)
 		} else {
 			// The process is dead — mark the tunnel as down so the UI
 			// doesn't show stale "up" entries.

@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/treykane/ssh-manager/internal/bundle"
+	"github.com/treykane/ssh-manager/internal/events"
 	"github.com/treykane/ssh-manager/internal/history"
 	"github.com/treykane/ssh-manager/internal/sshclient"
 )
@@ -163,6 +165,37 @@ func TestListRecentOrdering(t *testing.T) {
 	}
 	if !strings.Contains(lines[1], "db") {
 		t.Fatalf("expected db first after header, got: %s", lines[1])
+	}
+}
+
+func TestTunnelEventsJSONOutput(t *testing.T) {
+	setupSSHConfigForCLI(t)
+	store := events.NewStore()
+	if err := store.Append(events.Event{
+		Timestamp: time.Now().UTC(),
+		TunnelID:  "api|127.0.0.1:9501|localhost:80",
+		HostAlias: "api",
+		EventType: "start_succeeded",
+		Message:   "started",
+	}); err != nil {
+		t.Fatalf("append event: %v", err)
+	}
+
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"tunnel", "events", "--host", "api", "--json"})
+	out, err := captureStdout(func() error { return cmd.Execute() })
+	if err != nil {
+		t.Fatalf("events json: %v", err)
+	}
+	var payload []map[string]any
+	if err := json.Unmarshal([]byte(out), &payload); err != nil {
+		t.Fatalf("invalid events json: %v", err)
+	}
+	if len(payload) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(payload))
+	}
+	if payload[0]["event_type"] != "start_succeeded" {
+		t.Fatalf("unexpected event: %v", payload[0]["event_type"])
 	}
 }
 

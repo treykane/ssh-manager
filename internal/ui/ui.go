@@ -44,6 +44,7 @@ import (
 	"github.com/treykane/ssh-manager/internal/appconfig"
 	"github.com/treykane/ssh-manager/internal/bundle"
 	"github.com/treykane/ssh-manager/internal/config"
+	"github.com/treykane/ssh-manager/internal/events"
 	"github.com/treykane/ssh-manager/internal/history"
 	"github.com/treykane/ssh-manager/internal/model"
 	"github.com/treykane/ssh-manager/internal/security"
@@ -141,7 +142,9 @@ type dashboardModel struct {
 	bundles    []bundle.Definition
 	bundleSel  int
 
-	recentFirst bool
+	recentFirst  bool
+	showEvents   bool
+	recentEvents []events.Event
 }
 
 // initialModel creates the initial dashboardModel with loaded configuration,
@@ -180,6 +183,7 @@ func initialModel() dashboardModel {
 
 	m := dashboardModel{cfg: cfg, mgr: mgr, ssh: ssh}
 	m.reloadConfig()
+	m.refreshEvents(20)
 	m.status = "Ready. Select a host, Enter to connect, t for first tunnel, T for all."
 	return m
 }
@@ -280,6 +284,9 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Periodic refresh: snapshot tunnel states (including health checks)
 		// and schedule the next tick.
 		m.tunnels = m.mgr.Snapshot()
+		if m.showEvents {
+			m.refreshEvents(20)
+		}
 		return m, tickCmd(m.cfg.UI.RefreshSeconds)
 
 	case tea.WindowSizeMsg:
@@ -398,6 +405,15 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status = "Recent-first sorting enabled"
 			} else {
 				m.status = "Recent-first sorting disabled"
+			}
+
+		case "e":
+			m.showEvents = !m.showEvents
+			if m.showEvents {
+				m.refreshEvents(20)
+				m.status = "Events panel enabled"
+			} else {
+				m.status = "Events panel hidden"
 			}
 
 		case "r":
@@ -648,7 +664,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | b bundles | h recent-sort | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | b bundles | h recent-sort | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | e events | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -667,6 +683,10 @@ func (m dashboardModel) View() string {
 	// Render the tunnel table and status bar as full-width panels.
 	tunnels := m.renderPanel("Active Tunnels", tbl.String(), m.effectiveWidth(), lipgloss.Color("63"))
 	status := m.renderPanel("Status", m.status, m.effectiveWidth(), lipgloss.Color("205"))
+	eventsPanel := ""
+	if m.showEvents {
+		eventsPanel = m.renderPanel("Recent Events", m.eventsView(), m.effectiveWidth(), lipgloss.Color("214"))
+	}
 
 	// Conditionally render the help panel.
 	help := ""
@@ -683,6 +703,7 @@ func (m dashboardModel) View() string {
 		quickHelp,
 		main,
 		tunnels,
+		eventsPanel,
 		help,
 		warn,
 		status,
@@ -829,10 +850,37 @@ func (m dashboardModel) helpBlock() string {
 		"  Bundles: press b to open the bundle runner.",
 		"  Preflight: press c to validate selected host forwards before start.",
 		"  Tunnel: t toggles first forward; T processes all forwards; R restarts first forward.",
+		"  Events: press e to toggle recent tunnel lifecycle events.",
 		"  Recovery: press C to recover quarantined tunnels for selected host.",
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",
 	}, "\n")
+}
+
+func (m *dashboardModel) refreshEvents(limit int) {
+	recs, err := m.mgr.Events(events.Query{Limit: limit})
+	if err != nil {
+		slog.Warn("failed to read events", "error", err)
+		return
+	}
+	m.recentEvents = recs
+}
+
+func (m dashboardModel) eventsView() string {
+	if len(m.recentEvents) == 0 {
+		return "(no events)"
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("%-8s %-16s %-12s %s\n", "TIME", "EVENT", "HOST", "MESSAGE"))
+	for _, evt := range m.recentEvents {
+		b.WriteString(fmt.Sprintf("%-8s %-16s %-12s %s\n",
+			evt.Timestamp.Local().Format("15:04:05"),
+			evt.EventType,
+			util.EmptyDash(evt.HostAlias),
+			evt.Message,
+		))
+	}
+	return b.String()
 }
 
 func (m dashboardModel) bundleView() string {
