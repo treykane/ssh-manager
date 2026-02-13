@@ -55,6 +55,20 @@ func TestTunnelCheckJSONOutput(t *testing.T) {
 	}
 }
 
+func TestTunnelRecoverHostErrorWhenNoQuarantined(t *testing.T) {
+	setupSSHConfigForCLI(t)
+
+	cmd := NewRootCommand()
+	cmd.SetArgs([]string{"tunnel", "recover", "api"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected error when no quarantined tunnels exist")
+	}
+	if !strings.Contains(err.Error(), "no quarantined tunnel for host") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func captureStdout(fn func() error) (string, error) {
 	orig := os.Stdout
 	r, w, err := os.Pipe()

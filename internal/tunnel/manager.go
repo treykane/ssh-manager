@@ -429,6 +429,16 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 					go m.restartAfterDelay(id, rt, attempt)
 					return
 				}
+				rt.State = model.TunnelQuarantined
+				rt.PID = 0
+				rt.LastError = fmt.Sprintf("quarantined after %d failed restart attempts", m.restartMaxAttempts)
+				m.runtime[id] = rt
+				delete(m.cancel, id)
+				m.mu.Unlock()
+				if persistErr := m.persist(); persistErr != nil {
+					slog.Warn("failed to persist tunnel state after quarantine", "error", persistErr)
+				}
+				return
 			}
 			rt.State = model.TunnelError
 			rt.LastError = security.UserMessage(err, m.redactErrors)
@@ -446,6 +456,59 @@ func (m *Manager) watchProcess(id string, proc *sshclient.TunnelProcess) {
 	if persistErr := m.persist(); persistErr != nil {
 		slog.Warn("failed to persist tunnel state after process exit", "error", persistErr)
 	}
+}
+
+// Recover restarts a quarantined tunnel by ID.
+func (m *Manager) Recover(id string) (model.TunnelRuntime, error) {
+	m.mu.Lock()
+	rt, ok := m.runtime[id]
+	m.mu.Unlock()
+	if !ok {
+		return model.TunnelRuntime{}, fmt.Errorf("tunnel not found: %s", id)
+	}
+	if rt.State != model.TunnelQuarantined {
+		return model.TunnelRuntime{}, fmt.Errorf("tunnel is not quarantined: %s", id)
+	}
+	host, err := findHostByAlias(rt.HostAlias)
+	if err != nil {
+		return model.TunnelRuntime{}, err
+	}
+	fwd := rt.Forward
+	if fwd.LocalPort == 0 || fwd.RemotePort == 0 {
+		fwd, err = ParseForwardArg(fmt.Sprintf("%s:%s", rt.Local, rt.Remote))
+		if err != nil {
+			return model.TunnelRuntime{}, err
+		}
+	}
+	m.mu.Lock()
+	m.restartAttempts[id] = 0
+	m.mu.Unlock()
+	return m.Start(host, fwd)
+}
+
+// RecoverByHost restarts all quarantined tunnels for a host alias.
+func (m *Manager) RecoverByHost(hostAlias string) ([]model.TunnelRuntime, error) {
+	m.mu.Lock()
+	var ids []string
+	for id, rt := range m.runtime {
+		if rt.HostAlias == hostAlias && rt.State == model.TunnelQuarantined {
+			ids = append(ids, id)
+		}
+	}
+	m.mu.Unlock()
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("no quarantined tunnel for host %s", hostAlias)
+	}
+
+	out := make([]model.TunnelRuntime, 0, len(ids))
+	for _, id := range ids {
+		rt, err := m.Recover(id)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, rt)
+	}
+	return out, nil
 }
 
 func (m *Manager) restartAfterDelay(id string, prev model.TunnelRuntime, attempt int) {

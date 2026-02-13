@@ -303,6 +303,31 @@ func newTunnelCmd() *cobra.Command {
 	restart.Flags().BoolVar(&allowPublicBind, "allow-public-bind", false, "allow 0.0.0.0/:: local binds for this command")
 	restart.Flags().StringVar(&hostKeyPolicy, "host-key-policy", "", "host key policy override: strict, accept-new, insecure")
 
+	recover := &cobra.Command{
+		Use:   "recover <tunnel-id|host>",
+		Short: "Recover quarantined tunnel by id or all quarantined tunnels for host",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			idOrHost := args[0]
+			if strings.Contains(idOrHost, "|") {
+				rt, err := mgr.Recover(idOrHost)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("recovered %s pid=%d\n", rt.ID, rt.PID)
+				return nil
+			}
+			recovered, err := mgr.RecoverByHost(idOrHost)
+			if err != nil {
+				return err
+			}
+			for _, rt := range recovered {
+				fmt.Printf("recovered %s pid=%d\n", rt.ID, rt.PID)
+			}
+			return nil
+		},
+	}
+
 	// --- tunnel status -------------------------------------------------------
 
 	// jsonOut is the --json flag for the "status" subcommand.
@@ -384,7 +409,7 @@ func newTunnelCmd() *cobra.Command {
 	check.Flags().StringVar(&checkForwardArg, "forward", "", "forward index (0-based) or explicit spec localPort:remoteHost:remotePort")
 	check.Flags().BoolVar(&checkJSON, "json", false, "output JSON")
 
-	root.AddCommand(up, down, status, restart, check)
+	root.AddCommand(up, down, status, restart, recover, check)
 	return root
 }
 

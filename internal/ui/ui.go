@@ -440,6 +440,19 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = fmt.Sprintf("Processed %d forwards for %s (started=%d, stopped=%d)", len(h.Forwards), h.Alias, started, stopped)
 			m.tunnels = m.mgr.Snapshot()
 
+		case "C":
+			if len(m.filtered) == 0 {
+				break
+			}
+			h := m.filtered[m.sel]
+			recovered, err := m.mgr.RecoverByHost(h.Alias)
+			if err != nil {
+				m.status = "Recover failed: " + security.UserMessage(err, m.cfg.Security.RedactErrors)
+				break
+			}
+			m.status = fmt.Sprintf("Recovered %d quarantined tunnel(s) for %s", len(recovered), h.Alias)
+			m.tunnels = m.mgr.Snapshot()
+
 		case "R":
 			if len(m.filtered) == 0 {
 				break
@@ -495,7 +508,7 @@ func (m dashboardModel) View() string {
 	// --- Hosts panel (left side) ---
 
 	left := strings.Builder{}
-	left.WriteString("j/k to navigate; [T] means active tunnel.\n")
+	left.WriteString("j/k to navigate; [T] active, [Q] quarantined.\n")
 	for i, h := range m.filtered {
 		// Selection cursor: ">" for the selected host, " " for others.
 		cursor := " "
@@ -506,6 +519,9 @@ func (m dashboardModel) View() string {
 		tunnelMark := " "
 		if m.hostHasActiveTunnel(h.Alias) {
 			tunnelMark = "T"
+		}
+		if m.hostHasQuarantinedTunnel(h.Alias) {
+			tunnelMark = "Q"
 		}
 		left.WriteString(fmt.Sprintf("%s[%s] %-22s %-22s\n", cursor, tunnelMark, h.Alias, h.DisplayTarget()))
 	}
@@ -567,7 +583,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | c preflight | t first tunnel | T all tunnels | R restart first | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | c preflight | t first tunnel | T all tunnels | C recover quarantined | R restart first | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -654,6 +670,15 @@ func (m dashboardModel) hostHasActiveTunnel(alias string) bool {
 	return false
 }
 
+func (m dashboardModel) hostHasQuarantinedTunnel(alias string) bool {
+	for _, rt := range m.tunnels {
+		if rt.HostAlias == alias && rt.State == model.TunnelQuarantined {
+			return true
+		}
+	}
+	return false
+}
+
 // guidanceForHost generates contextual "next steps" text for the detail panel
 // based on the selected host's configuration and current tunnel state.
 //
@@ -683,7 +708,7 @@ func (m dashboardModel) guidanceForHost(h model.HostEntry) string {
 	} else {
 		lines = append(lines, "  - Press t to start the first LocalForward tunnel.")
 	}
-	lines = append(lines, "  - Press T to process all forwards, or R to restart the first forward.")
+	lines = append(lines, "  - Press T to process all forwards, C to recover quarantined tunnels, or R to restart the first forward.")
 
 	// If the host has multiple forwards, hint that the CLI can target specific ones.
 	if len(h.Forwards) > 1 {
@@ -735,6 +760,7 @@ func (m dashboardModel) helpBlock() string {
 		"  New: press n to configure a new SSH connection.",
 		"  Preflight: press c to validate selected host forwards before start.",
 		"  Tunnel: t toggles first forward; T processes all forwards; R restarts first forward.",
+		"  Recovery: press C to recover quarantined tunnels for selected host.",
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",
 	}, "\n")

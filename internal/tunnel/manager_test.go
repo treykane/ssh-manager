@@ -425,7 +425,7 @@ func TestManagerAutoRestartUnexpectedExit(t *testing.T) {
 	t.Fatalf("expected restarted tunnel to become up; state=%s calls=%d", got.State, starter.calls)
 }
 
-func TestManagerAutoRestartStopsAtMaxAttempts(t *testing.T) {
+func TestManagerAutoRestartQuarantinesAtMaxAttempts(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -447,8 +447,8 @@ func TestManagerAutoRestartStopsAtMaxAttempts(t *testing.T) {
 	if gerr != nil {
 		t.Fatal(gerr)
 	}
-	if got.State != model.TunnelError {
-		t.Fatalf("expected error state after max attempts, got %s", got.State)
+	if got.State != model.TunnelQuarantined {
+		t.Fatalf("expected quarantined state after max attempts, got %s", got.State)
 	}
 	if atomic.LoadInt32(&starter.calls) != 3 {
 		t.Fatalf("expected initial + 2 restart attempts, got %d", starter.calls)
@@ -497,5 +497,88 @@ func writeSSHConfig(t *testing.T, home string, alias string) {
 	content := "Host " + alias + "\n  HostName 127.0.0.1\n"
 	if err := os.WriteFile(filepath.Join(sshDir, "config"), []byte(content), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestManagerRecoverQuarantinedTunnel(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSSHConfig(t, home, "api")
+
+	starter := &flakyStarter{failures: 10}
+	m := NewManager(starter)
+	m.SetRestartPolicy(true, 1, 1, 1)
+
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9514, RemoteAddr: "localhost", RemotePort: 80}
+	rt, err := m.Start(h, fwd)
+	if err != nil {
+		t.Fatalf("start failed: %v", err)
+	}
+
+	time.Sleep(2500 * time.Millisecond)
+	q, err := m.Get(rt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.State != model.TunnelQuarantined {
+		t.Fatalf("expected quarantined state, got %s", q.State)
+	}
+
+	atomic.StoreInt32(&starter.failures, 0)
+	recovered, err := m.Recover(rt.ID)
+	if err != nil {
+		t.Fatalf("recover failed: %v", err)
+	}
+	defer func() { _ = m.Stop(recovered.ID) }()
+	if recovered.State != model.TunnelUp {
+		t.Fatalf("expected recovered tunnel up, got %s", recovered.State)
+	}
+}
+
+func TestManagerRecoverByHost(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	writeSSHConfig(t, home, "api")
+
+	m := NewManager(fakeStarter{})
+	fwd1 := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9515, RemoteAddr: "localhost", RemotePort: 80}
+	fwd2 := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9516, RemoteAddr: "localhost", RemotePort: 81}
+	id1 := RuntimeID("api", fwd1)
+	id2 := RuntimeID("api", fwd2)
+
+	m.mu.Lock()
+	m.runtime[id1] = model.TunnelRuntime{
+		ID:        id1,
+		HostAlias: "api",
+		Forward:   fwd1,
+		Local:     "127.0.0.1:9515",
+		Remote:    "localhost:80",
+		State:     model.TunnelQuarantined,
+	}
+	m.runtime[id2] = model.TunnelRuntime{
+		ID:        id2,
+		HostAlias: "api",
+		Forward:   fwd2,
+		Local:     "127.0.0.1:9516",
+		Remote:    "localhost:81",
+		State:     model.TunnelQuarantined,
+	}
+	m.mu.Unlock()
+
+	recovered, err := m.RecoverByHost("api")
+	if err != nil {
+		t.Fatalf("recover by host failed: %v", err)
+	}
+	if len(recovered) != 2 {
+		t.Fatalf("expected 2 recovered tunnels, got %d", len(recovered))
+	}
+	for _, rt := range recovered {
+		defer func(id string) { _ = m.Stop(id) }(rt.ID)
+		if rt.State != model.TunnelUp {
+			t.Fatalf("expected recovered tunnel up, got %s", rt.State)
+		}
 	}
 }
