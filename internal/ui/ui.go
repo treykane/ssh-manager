@@ -393,6 +393,24 @@ func (m dashboardModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = m.toggleForward(h, 0)
 			m.tunnels = m.mgr.Snapshot()
 
+		case "c":
+			if len(m.filtered) == 0 {
+				break
+			}
+			h := m.filtered[m.sel]
+			if len(h.Forwards) == 0 {
+				m.status = "Preflight: no LocalForward entries for host " + h.Alias
+				break
+			}
+			passed := 0
+			for _, fwd := range h.Forwards {
+				rep := m.mgr.Preflight(h, fwd)
+				if rep.OK {
+					passed++
+				}
+			}
+			m.status = fmt.Sprintf("Preflight %s: %d/%d forwards passed", h.Alias, passed, len(h.Forwards))
+
 		case "T":
 			if len(m.filtered) == 0 {
 				break
@@ -543,7 +561,7 @@ func (m dashboardModel) View() string {
 
 	// --- Quick-reference keybinding bar ---
 
-	quickHelp := "Keys: Enter connect | n new | t first tunnel | T all tunnels | R restart first | / filter | r refresh | ? help | q quit"
+	quickHelp := "Keys: Enter connect | n new | c preflight | t first tunnel | T all tunnels | R restart first | / filter | r refresh | ? help | q quit"
 
 	// --- Compose the final layout ---
 
@@ -709,6 +727,7 @@ func (m dashboardModel) helpBlock() string {
 		"  Filtering: press /, type alias/host text, then Enter.",
 		"  Connect: press Enter on selected host.",
 		"  New: press n to configure a new SSH connection.",
+		"  Preflight: press c to validate selected host forwards before start.",
 		"  Tunnel: t toggles first forward; T processes all forwards; R restarts first forward.",
 		"  Refresh: press r to reparse ssh config and refresh runtime snapshot.",
 		"  Quit: press q (or Ctrl+C) and all managed tunnels are stopped.",

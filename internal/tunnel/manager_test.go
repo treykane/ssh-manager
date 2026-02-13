@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -325,5 +326,46 @@ func TestLoadRuntimeQuarantinesMismatchedProcess(t *testing.T) {
 	}
 	if got.State != model.TunnelQuarantined {
 		t.Fatalf("expected quarantined state, got %s", got.State)
+	}
+}
+
+func TestPreflight_Pass(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := NewManager(fakeStarter{})
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: 9401, RemoteAddr: "localhost", RemotePort: 80}
+
+	rep := m.Preflight(h, fwd)
+	if !rep.OK {
+		t.Fatalf("expected preflight pass, got %+v", rep)
+	}
+}
+
+func TestPreflight_FailsForPortInUse(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	m := NewManager(fakeStarter{})
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "127.0.0.1", LocalPort: port, RemoteAddr: "localhost", RemotePort: 80}
+	rep := m.Preflight(h, fwd)
+	if rep.OK {
+		t.Fatalf("expected port-in-use preflight failure, got %+v", rep)
+	}
+}
+
+func TestPreflight_FailsForPublicBindWithoutOverride(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	m := NewManager(fakeStarter{})
+	h := model.HostEntry{Alias: "api"}
+	fwd := model.ForwardSpec{LocalAddr: "0.0.0.0", LocalPort: 9402, RemoteAddr: "localhost", RemotePort: 80}
+	rep := m.Preflight(h, fwd)
+	if rep.OK {
+		t.Fatalf("expected bind-policy failure, got %+v", rep)
 	}
 }

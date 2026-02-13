@@ -101,6 +101,22 @@ type Manager struct {
 	redactErrors bool
 }
 
+// PreflightFinding captures one check result in a tunnel preflight run.
+type PreflightFinding struct {
+	Check   string `json:"check"`
+	OK      bool   `json:"ok"`
+	Message string `json:"message"`
+}
+
+// PreflightReport describes whether a tunnel forward is safe/ready to start.
+type PreflightReport struct {
+	HostAlias string             `json:"host_alias"`
+	Local     string             `json:"local"`
+	Remote    string             `json:"remote"`
+	OK        bool               `json:"ok"`
+	Findings  []PreflightFinding `json:"findings"`
+}
+
 // TunnelStarter abstracts SSH tunnel process creation for testing.
 //
 // In production, *sshclient.Client implements this interface. In tests, a fake
@@ -137,6 +153,82 @@ func (m *Manager) SetAllowPublicBind(allow bool) {
 
 func (m *Manager) SetRedactErrors(redact bool) {
 	m.redactErrors = redact
+}
+
+// Preflight validates a single tunnel forward without starting a process.
+func (m *Manager) Preflight(host model.HostEntry, fwd model.ForwardSpec) PreflightReport {
+	report := PreflightReport{
+		HostAlias: host.Alias,
+		Local:     fmt.Sprintf("%s:%d", util.NormalizeAddr(fwd.LocalAddr, "127.0.0.1"), fwd.LocalPort),
+		Remote:    fmt.Sprintf("%s:%d", util.NormalizeAddr(fwd.RemoteAddr, "localhost"), fwd.RemotePort),
+		OK:        true,
+	}
+	add := func(check string, ok bool, message string) {
+		report.Findings = append(report.Findings, PreflightFinding{
+			Check:   check,
+			OK:      ok,
+			Message: message,
+		})
+		if !ok {
+			report.OK = false
+		}
+	}
+
+	if err := sshclient.EnsureSSHBinary(); err != nil {
+		add("ssh-binary", false, err.Error())
+	} else {
+		add("ssh-binary", true, "ssh binary found on PATH")
+	}
+
+	if err := util.ValidatePort(fwd.LocalPort); err != nil {
+		add("local-port", false, fmt.Sprintf("invalid local port: %v", err))
+	} else {
+		add("local-port", true, "local port is valid")
+	}
+
+	if err := util.ValidatePort(fwd.RemotePort); err != nil {
+		add("remote-port", false, fmt.Sprintf("invalid remote port: %v", err))
+	} else {
+		add("remote-port", true, "remote port is valid")
+	}
+
+	if err := validateForwardSpec(fwd); err != nil {
+		add("forward-shape", false, err.Error())
+	} else {
+		add("forward-shape", true, "forward endpoints look valid")
+	}
+
+	if m.bindPolicy == appconfig.BindPolicyLoopbackOnly && !m.allowPublicBind && isPublicBindAddr(fwd.LocalAddr) {
+		add("bind-policy", false, "public bind requires allow-public override")
+	} else {
+		add("bind-policy", true, "bind policy check passed")
+	}
+
+	if canUse, msg := m.canBindLocal(host.Alias, fwd); !canUse {
+		add("local-bind", false, msg)
+	} else {
+		add("local-bind", true, msg)
+	}
+
+	return report
+}
+
+func (m *Manager) canBindLocal(hostAlias string, fwd model.ForwardSpec) (bool, string) {
+	id := RuntimeID(hostAlias, fwd)
+	m.mu.Lock()
+	rt, ok := m.runtime[id]
+	m.mu.Unlock()
+	if ok && (rt.State == model.TunnelUp || rt.State == model.TunnelStarting) {
+		return true, "already active in manager runtime"
+	}
+
+	local := fmt.Sprintf("%s:%d", util.NormalizeAddr(fwd.LocalAddr, "127.0.0.1"), fwd.LocalPort)
+	ln, err := net.Listen("tcp", local)
+	if err != nil {
+		return false, fmt.Sprintf("local bind unavailable: %v", err)
+	}
+	_ = ln.Close()
+	return true, "local bind is available"
 }
 
 // RuntimeID generates a unique, deterministic identifier for a tunnel based on

@@ -301,6 +301,8 @@ func newTunnelCmd() *cobra.Command {
 
 	// jsonOut is the --json flag for the "status" subcommand.
 	var jsonOut bool
+	var checkForwardArg string
+	var checkJSON bool
 
 	status := &cobra.Command{
 		Use:   "status",
@@ -332,7 +334,51 @@ func newTunnelCmd() *cobra.Command {
 	}
 	status.Flags().BoolVar(&jsonOut, "json", false, "output JSON")
 
-	root.AddCommand(up, down, status, restart)
+	check := &cobra.Command{
+		Use:   "check <host>",
+		Short: "Run tunnel preflight checks for host forwards",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			host, err := findHost(args[0])
+			if err != nil {
+				return err
+			}
+			forwards, err := resolveForwards(host, checkForwardArg)
+			if err != nil {
+				return err
+			}
+			reports := make([]tunnel.PreflightReport, 0, len(forwards))
+			for _, fwd := range forwards {
+				reports = append(reports, mgr.Preflight(host, fwd))
+			}
+
+			if checkJSON {
+				enc := json.NewEncoder(os.Stdout)
+				enc.SetIndent("", "  ")
+				return enc.Encode(reports)
+			}
+
+			for _, rep := range reports {
+				state := "PASS"
+				if !rep.OK {
+					state = "FAIL"
+				}
+				fmt.Printf("[%s] %s %s -> %s\n", state, rep.HostAlias, rep.Local, rep.Remote)
+				for _, f := range rep.Findings {
+					checkState := "ok"
+					if !f.OK {
+						checkState = "fail"
+					}
+					fmt.Printf("  - %-12s %-4s %s\n", f.Check, checkState, f.Message)
+				}
+			}
+			return nil
+		},
+	}
+	check.Flags().StringVar(&checkForwardArg, "forward", "", "forward index (0-based) or explicit spec localPort:remoteHost:remotePort")
+	check.Flags().BoolVar(&checkJSON, "json", false, "output JSON")
+
+	root.AddCommand(up, down, status, restart, check)
 	return root
 }
 
